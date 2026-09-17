@@ -391,19 +391,47 @@ fn make_self_contained(pairs: &mut Vec<(String, String)>) {
 }
 
 #[test]
-fn the_shipped_compose_file_only_uses_settings_that_exist() {
-    let yaml = include_str!("../docker-compose.yml");
-    let mut pairs = compose_environment(yaml);
-    assert!(
-        pairs
-            .iter()
-            .any(|(k, _)| k.starts_with("MINI_ROUTER_POOL_")),
-        "the example should demonstrate a pool; parsed {pairs:#?}"
-    );
-    make_self_contained(&mut pairs);
+fn the_shipped_compose_files_only_use_settings_that_exist() {
+    // Both of them: the one that builds from this checkout and the one that
+    // pulls the published image. They carry the same environment block, and
+    // either drifting is the same bug.
+    for (name, yaml) in [
+        ("docker-compose.yml", include_str!("../docker-compose.yml")),
+        (
+            "docker-compose.hub.yml",
+            include_str!("../docker-compose.hub.yml"),
+        ),
+    ] {
+        let mut pairs = compose_environment(yaml);
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, _)| k.starts_with("MINI_ROUTER_POOL_")),
+            "{name} should demonstrate a pool; parsed {pairs:#?}"
+        );
+        make_self_contained(&mut pairs);
 
-    if let Err(e) = env::load(&pairs) {
-        panic!("docker-compose.yml has drifted from what mini-router accepts: {e}");
+        if let Err(e) = env::load(&pairs) {
+            panic!("{name} has drifted from what mini-router accepts: {e}");
+        }
+    }
+}
+
+/// The published image has no shell tooling -- `--healthcheck` exists so it
+/// does not need any -- so a compose file that overrides the healthcheck with
+/// `wget` or `curl` would break against it. The build-from-source image is
+/// alpine and does have busybox wget, which is why only the hub file is
+/// checked here.
+#[test]
+fn the_hub_compose_file_does_not_reach_for_shell_tooling() {
+    let yaml = include_str!("../docker-compose.hub.yml");
+    for line in yaml.lines() {
+        let code = line.split('#').next().unwrap_or("");
+        assert!(
+            !code.contains("wget") && !code.contains("curl"),
+            "docker-compose.hub.yml must not depend on shell tooling the \
+             published image does not carry: {line}"
+        );
     }
 }
 

@@ -81,11 +81,17 @@ services:
 
 ```sh
 cp .env.example .env     # put your provider keys in it
-docker compose up -d
+docker compose -f docker-compose.hub.yml up -d
 ```
 
-The repo ships a working `docker-compose.yml` and `.env.example`. Or without
-Docker:
+Two compose files ship with the repo, both reading the same `.env`:
+
+| File | What it does |
+|---|---|
+| `docker-compose.hub.yml` | Pulls [`sudtanj/mini-router`](https://hub.docker.com/r/sudtanj/mini-router) — multi-arch, so it runs on an Orange Pi Zero 3 unchanged. Nothing to build. |
+| `docker-compose.yml` | Builds from this checkout via `deploy/Dockerfile`. |
+
+Or without Docker:
 
 ```sh
 cargo build --release

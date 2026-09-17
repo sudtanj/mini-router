@@ -298,6 +298,15 @@ fn base_url_join_is_slash_safe() {
 /// Pull `KEY: value` pairs out of the `environment:` block of a compose file,
 /// including the commented-out examples, which are documentation too.
 fn compose_environment(yaml: &str) -> Vec<(String, String)> {
+    compose_environment_inner(yaml, true)
+}
+
+/// Only the lines that are actually in effect, ignoring commented examples.
+fn compose_environment_active(yaml: &str) -> Vec<(String, String)> {
+    compose_environment_inner(yaml, false)
+}
+
+fn compose_environment_inner(yaml: &str, include_commented: bool) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut indent = None;
     for line in yaml.lines() {
@@ -312,6 +321,9 @@ fn compose_environment(yaml: &str) -> Vec<(String, String)> {
             Some(block) => {
                 if !trimmed.is_empty() && depth <= block {
                     break; // out of the environment block
+                }
+                if !include_commented && trimmed.starts_with('#') {
+                    continue;
                 }
                 let content = trimmed.trim_start_matches("# ").trim_start_matches('#');
                 let Some((key, value)) = content.split_once(american_colon()) else {
@@ -383,7 +395,10 @@ fn make_self_contained(pairs: &mut Vec<(String, String)>) {
             "MINI_ROUTER_PROVIDER_{}_URL",
             name.to_uppercase().replace('-', "_")
         );
-        if !pairs.iter().any(|(k, _)| *k == key) {
+        // Present-but-empty is not defined: an empty value is how compose
+        // renders an unset `${VAR:-}`, and mini-router skips those. Checking
+        // only for the key would leave the provider without a URL.
+        if !pairs.iter().any(|(k, v)| *k == key && !v.is_empty()) {
             pairs.push((key, format!("http://{name}.invalid/v1")));
         }
     }
@@ -456,5 +471,92 @@ fn the_shipped_env_example_only_uses_settings_that_exist() {
 
     if let Err(e) = env::load(&pairs) {
         panic!(".env.example has drifted from what mini-router accepts: {e}");
+    }
+}
+
+/// Read `KEY=value` pairs out of a dotenv file, ignoring commented examples.
+fn dotenv(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect()
+}
+
+/// Resolve compose's `${VAR}`, `${VAR:-default}` and `${VAR:?message}` against
+/// a dotenv map, the way `docker compose` would.
+fn substitute(value: &str, env: &std::collections::BTreeMap<String, String>) -> Option<String> {
+    let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
+        return Some(value.to_string());
+    };
+    let (name, fallback) = match inner.split_once(":-") {
+        Some((n, d)) => (n, Some(d.to_string())),
+        None => match inner.split_once(":?") {
+            // `:?` means compose refuses to start when the value is empty.
+            Some((n, _)) => (n, None),
+            None => (inner, Some(String::new())),
+        },
+    };
+    match env.get(name) {
+        Some(v) if !v.is_empty() => Some(v.clone()),
+        _ => fallback,
+    }
+}
+
+/// The first run a real person has: copy both shipped files, fill in one
+/// provider key and the client key the compose file insists on, start it.
+///
+/// This is the whole point of the pair being shipped together, and it is easy
+/// to break from either side -- a pool default naming a provider the user has
+/// no key for stops mini-router dead, and so does a half-filled custom
+/// provider. Both have happened.
+#[test]
+fn the_shipped_files_start_with_a_single_provider_key() {
+    let dotenv_map = dotenv(include_str!("../.env.example"));
+
+    for (name, yaml) in [
+        ("docker-compose.yml", include_str!("../docker-compose.yml")),
+        (
+            "docker-compose.hub.yml",
+            include_str!("../docker-compose.hub.yml"),
+        ),
+    ] {
+        let mut env = dotenv_map.clone();
+        // The two things the instructions tell you to fill in.
+        env.insert("OPENAI_API_KEY".into(), "sk-test".into());
+        env.insert("MINI_ROUTER_API_KEYS".into(), "sk-client".into());
+
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (key, raw) in compose_environment_active(yaml) {
+            match substitute(&raw, &env) {
+                Some(v) => pairs.push((key, v)),
+                None => panic!(
+                    "{name}: {key} uses compose's `:?` form and .env.example leaves it \
+                     empty, so `docker compose up` would refuse to start"
+                ),
+            }
+        }
+        // Provider keys reach mini-router from the process environment, not
+        // through the compose `environment:` block, so pass them alongside.
+        pairs.push(("OPENAI_API_KEY".into(), "sk-test".into()));
+
+        let cfg = match env::load(&pairs) {
+            Ok(r) => r.config,
+            Err(e) => panic!(
+                "{name} plus the shipped .env.example does not start with one \
+                 provider key: {e}"
+            ),
+        };
+        assert_eq!(
+            cfg.upstreams.len(),
+            1,
+            "{name}: expected just the one provider whose key was filled in, got {:?}",
+            cfg.upstreams.iter().map(|u| &u.name).collect::<Vec<_>>()
+        );
+        assert!(
+            cfg.server.auth.require_auth,
+            "{name}: the shipped files should not leave the port open"
+        );
     }
 }

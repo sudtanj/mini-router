@@ -32,7 +32,23 @@ services:
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
 
-      # Anything else, or to point a well-known provider somewhere else:
+      # --- A custom provider: a proxy, a gateway, anything not listed above --
+      # Three variables define one. <NAME> is yours to pick (uppercase;
+      # underscores in it become dashes) and is what you reference in a pool.
+      #
+      # Take all three from .env, never hardcode one here: a variable left
+      # literal while its neighbours come from an empty .env leaves the
+      # provider half-defined, and mini-router refuses to start with
+      #   provider "myproxy" needs a URL
+      # With all three empty the provider simply does not exist, which is what
+      # you want until the .env is filled in.
+      MINI_ROUTER_PROVIDER_MYPROXY_URL: ${MYPROXY_URL:-}
+      MINI_ROUTER_PROVIDER_MYPROXY_PROTOCOL: ${MYPROXY_PROTOCOL:-}
+      MINI_ROUTER_PROVIDER_MYPROXY_API_KEY: ${MYPROXY_API_KEY:-}
+      # Then put it in a pool, by the name you chose:
+      #   MINI_ROUTER_POOL_FAST: myproxy:gpt-4o-mini,openai:gpt-4o-mini
+
+      # A local model server is the same thing with no key:
       # MINI_ROUTER_PROVIDER_LOCAL_URL: http://ollama:11434/v1
       # MINI_ROUTER_PROVIDER_LOCAL_MAX_CONCURRENCY: "1"
 
@@ -40,17 +56,34 @@ services:
       # One client-facing name over several provider models, in priority order.
       # The first one serves; anything that fails spills to the next, across
       # providers and across dialects.
-      MINI_ROUTER_POOL_FAST: openai:gpt-4o-mini,anthropic:claude-haiku-4-5
-      MINI_ROUTER_POOL_SMART: anthropic:claude-sonnet-4-5,openai:gpt-4o
+      #
+      # Defined in .env, not here, because a pool can only name providers you
+      # actually have a key for -- naming one you do not is a startup error
+      # ("pool \"fast\" refers to unknown upstream \"anthropic\""). Leaving
+      # them empty is fine: ask for real model names and routing still works.
+      MINI_ROUTER_POOL_FAST: ${MINI_ROUTER_POOL_FAST:-}
+      MINI_ROUTER_POOL_SMART: ${MINI_ROUTER_POOL_SMART:-}
 
-      # Apps with a hard-coded model name can still reach a pool.
-      MINI_ROUTER_ALIASES: gpt-3.5-turbo=fast,gpt-4o-mini=fast
+      # Apps with a hard-coded model name can still reach a pool. Only set this
+      # once the pool it points at exists.
+      MINI_ROUTER_ALIASES: ${MINI_ROUTER_ALIASES:-}
 
-      # --- Access ------------------------------------------------------------
-      # Turn this on if anything but you can reach the port: these keys are what
-      # stand between a stray device and your provider bills.
+      # --- Access: the key YOUR clients send to mini-router -------------------
+      # Not a provider key. This is the one you invent and hand to your own
+      # apps; mini-router checks it, then replaces it with the provider's own
+      # key on the way out, so a client never sees a provider credential.
+      #
+      # Generate one:  openssl rand -hex 32
+      # Comma-separated for several (per-device, so you can revoke just one):
+      #   MINI_ROUTER_API_KEYS: sk-laptop-aaa,sk-phone-bbb
+      #
+      # The :? below is deliberate -- compose refuses to start rather than
+      # silently leave the port open if .env has no key in it.
       MINI_ROUTER_REQUIRE_AUTH: "true"
       MINI_ROUTER_API_KEYS: ${MINI_ROUTER_API_KEYS:?set MINI_ROUTER_API_KEYS in .env}
+      #
+      # Clients then send it as either dialect's header, whichever their SDK
+      # uses:  Authorization: Bearer <key>   or   x-api-key: <key>
 
       # --- Trimming ----------------------------------------------------------
       # Both are JSON/text endpoints, not a dashboard -- mini-router has no web

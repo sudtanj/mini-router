@@ -50,20 +50,43 @@ services:
       # MINI_ROUTER_PROVIDER_LOCAL_MAX_CONCURRENCY: "1"
 
       # --- Pools -------------------------------------------------------------
-      # One client-facing name over several provider models, in priority order.
-      # The first one serves; anything that fails spills to the next, across
-      # providers and across dialects.
+      # One client-facing name over several provider models. Order is priority:
+      # the first member serves, and anything that fails spills to the next --
+      # across providers and across dialects.
       #
-      # Defined in .env, not here, because a pool can only name providers you
-      # actually have a key for -- naming one you do not is a startup error
-      # ("pool \"fast\" refers to unknown upstream \"anthropic\""). Leaving
-      # them empty is fine: ask for real model names and routing still works.
-      MINI_ROUTER_POOL_FAST: ${MINI_ROUTER_POOL_FAST:-}
-      MINI_ROUTER_POOL_SMART: ${MINI_ROUTER_POOL_SMART:-}
-
-      # Apps with a hard-coded model name can still reach a pool. Only set this
-      # once the pool it points at exists.
-      MINI_ROUTER_ALIASES: ${MINI_ROUTER_ALIASES:-}
+      # Written one per line with YAML's `|`, so the order reads top to bottom.
+      # A real YAML list (`- openai:gpt-4o-mini`) is not possible here: a
+      # compose `environment:` value becomes a process environment variable,
+      # and those are strings, so compose rejects a list. `|` keeps it one
+      # string while still giving you a line per member. Commas work too if you
+      # prefer them: `openai:gpt-4o-mini,anthropic:claude-haiku-4-5`.
+      #
+      # Pools live here rather than in .env because .env holds secrets and this
+      # holds structure -- and a pool can only name providers you actually have
+      # a key for. Naming one you do not is a startup error:
+      #   pool "fast" refers to unknown upstream "anthropic"
+      # So uncomment the variant matching the keys you filled in. Leaving all
+      # of them commented is fine: ask for real model names and routing works.
+      #
+      # With both an OpenAI and an Anthropic key:
+      # MINI_ROUTER_POOL_FAST: |
+      #   openai:gpt-4o-mini
+      #   anthropic:claude-haiku-4-5
+      # MINI_ROUTER_POOL_SMART: |
+      #   anthropic:claude-sonnet-4-5
+      #   openai:gpt-4o
+      #
+      # With only an OpenAI key:
+      # MINI_ROUTER_POOL_FAST: |
+      #   openai:gpt-4o-mini
+      # MINI_ROUTER_POOL_SMART: |
+      #   openai:gpt-4o
+      #
+      # Apps with a hard-coded model name reach a pool through an alias. Only
+      # set this once the pool it points at exists.
+      # MINI_ROUTER_ALIASES: |
+      #   gpt-3.5-turbo=fast
+      #   gpt-4o-mini=fast
 
       # --- Access: the key YOUR clients send to mini-router -------------------
       # Not a provider key. This is the one you invent and hand to your own

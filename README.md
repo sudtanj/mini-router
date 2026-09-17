@@ -208,7 +208,7 @@ MINI_ROUTER_PROVIDER_LOCAL_MAX_CONCURRENCY: "1"
 
 | Variable | |
 |---|---|
-| `MINI_ROUTER_POOL_<NAME>` | `provider:model,provider:model`, in priority order |
+| `MINI_ROUTER_POOL_<NAME>` | `provider:model` per line (or comma-separated), in priority order |
 | `MINI_ROUTER_POOL_<NAME>_STRATEGY` | overrides the global strategy |
 | `MINI_ROUTER_POOL_<NAME>_WEIGHTS` | one per member |
 | `MINI_ROUTER_POOL_<NAME>_DESCRIPTION` | shown in the catalogue |
@@ -254,9 +254,17 @@ A pool is one client-facing name over several provider models, tried in the
 order you wrote them:
 
 ```yaml
-MINI_ROUTER_POOL_SMART: anthropic:claude-sonnet-4-5,openai:gpt-4o
+MINI_ROUTER_POOL_SMART: |
+  anthropic:claude-sonnet-4-5
+  openai:gpt-4o
 MINI_ROUTER_POOL_SMART_DESCRIPTION: The good models, for when it matters
 ```
+
+One member per line, top to bottom in priority order. A real YAML list
+(`- anthropic:...`) is not available here: a compose `environment:` value has
+to become a process environment variable, and those are strings, so compose
+rejects a list. YAML's `|` keeps it one string while still giving you a line
+per member. Commas work too — `a:model,b:model` — if you prefer them.
 
 The first member serves. If it fails — for **any** reason — the second one
 does, and the client never learns there was a problem. Response headers say
@@ -272,7 +280,9 @@ Pools can override the global strategy — useful to burn two accounts' quota
 evenly rather than exhausting one and then the other:
 
 ```yaml
-MINI_ROUTER_POOL_SPREAD: openai:gpt-4o-mini,groq:llama-3.3-70b-versatile
+MINI_ROUTER_POOL_SPREAD: |
+  openai:gpt-4o-mini
+  groq:llama-3.3-70b-versatile
 MINI_ROUTER_POOL_SPREAD_STRATEGY: round-robin
 MINI_ROUTER_POOL_SPREAD_WEIGHTS: "1,3"
 ```

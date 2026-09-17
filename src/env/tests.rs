@@ -502,6 +502,44 @@ fn lists_tolerate_spacing() {
     assert!(split_list(" , ").is_empty());
 }
 
+/// A compose block scalar arrives as one string with newlines in it. Order is
+/// the whole point for a pool, so it has to survive.
+#[test]
+fn lists_may_be_written_one_per_line() {
+    assert_eq!(
+        split_list("openai:gpt-4o-mini\nanthropic:claude-haiku-4-5\n"),
+        ["openai:gpt-4o-mini", "anthropic:claude-haiku-4-5"]
+    );
+    // Indented, the way a block scalar under `environment:` is written.
+    assert_eq!(
+        split_list("\n  first\n  second\n  third\n"),
+        ["first", "second", "third"]
+    );
+    // Mixed, and CRLF, because someone will.
+    assert_eq!(split_list("a,b\nc\r\nd"), ["a", "b", "c", "d"]);
+    assert!(split_list("\n\n  \n").is_empty());
+}
+
+#[test]
+fn a_pool_can_be_written_one_member_per_line() {
+    let r = resolve(&[
+        OPENAI,
+        ANTHROPIC_URL,
+        ANTHROPIC_PROTO,
+        (
+            "MINI_ROUTER_POOL_FAST",
+            "openai:gpt-4o-mini\nanthropic:claude-haiku-4-5\n",
+        ),
+    ]);
+    let pool = &r.config.pools["fast"];
+    assert_eq!(pool.members.len(), 2);
+    // Written order is priority order, exactly as with commas.
+    assert_eq!(pool.members[0].upstream, "openai");
+    assert_eq!(pool.members[0].model, "gpt-4o-mini");
+    assert_eq!(pool.members[1].upstream, "anthropic");
+    assert_eq!(pool.members[1].model, "claude-haiku-4-5");
+}
+
 #[test]
 fn pairs_need_an_equals() {
     let err = parse_pairs("X", "a").unwrap_err().to_string();

@@ -306,57 +306,112 @@ fn compose_environment_active(yaml: &str) -> Vec<(String, String)> {
     compose_environment_inner(yaml, false)
 }
 
+/// Pull `KEY: value` pairs out of the `environment:` block of a compose file.
+///
+/// Handles YAML block scalars (`KEY: |` followed by indented lines), because
+/// that is how a pool is written one member per line, and optionally reads the
+/// commented-out examples too -- those are documentation, and documentation
+/// that names a setting mini-router dropped is exactly the drift worth
+/// catching.
 fn compose_environment_inner(yaml: &str, include_commented: bool) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut indent = None;
-    for line in yaml.lines() {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut block: Option<usize> = None;
+
+    // Strip one layer of comment marker. Returns the content with its own
+    // indentation removed, plus how deep it sits -- for a commented line that
+    // is the `#` column plus whatever spaces follow inside the comment, so a
+    // commented block scalar nests exactly like an active one.
+    let read = |line: &str| -> Option<(usize, String)> {
+        let trimmed = line.trim_start();
+        let base = line.len() - trimmed.len();
+        if trimmed.starts_with('#') {
+            if !include_commented {
+                return None;
+            }
+            let rest = trimmed
+                .strip_prefix("# ")
+                .or_else(|| trimmed.strip_prefix('#'))
+                .unwrap_or(trimmed);
+            let inner = rest.len() - rest.trim_start().len();
+            return Some((base + inner, rest.trim().to_string()));
+        }
+        Some((base, trimmed.to_string()))
+    };
+
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut i = 0;
+    // Find the environment block.
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if trimmed == "environment:" {
+            block = Some(lines[i].len() - trimmed.len());
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    let Some(block_indent) = block else {
+        return out;
+    };
+
+    while i < lines.len() {
+        let line = lines[i];
         let trimmed = line.trim_start();
         let depth = line.len() - trimmed.len();
-        match indent {
-            None => {
-                if trimmed == "environment:" {
-                    indent = Some(depth);
-                }
-            }
-            Some(block) => {
-                if !trimmed.is_empty() && depth <= block {
-                    break; // out of the environment block
-                }
-                if !include_commented && trimmed.starts_with('#') {
-                    continue;
-                }
-                let content = trimmed.trim_start_matches("# ").trim_start_matches('#');
-                let Some((key, value)) = content.split_once(american_colon()) else {
-                    continue;
-                };
-                let key = key.trim();
-                if !key
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-                {
-                    continue;
-                }
-                let value = value.trim().trim_matches('"');
-                // `${VAR}` and `${VAR:-default}` are compose's own syntax; a
-                // real deployment substitutes them, so stand in a value.
-                let value = if value.starts_with("${") {
-                    if value.contains(":-}") {
-                        ""
-                    } else {
-                        "sk-test"
-                    }
-                } else {
-                    value
-                };
-                out.push((key.to_string(), value.to_string()));
-            }
+        if !trimmed.is_empty() && depth <= block_indent {
+            break; // out of the environment block
         }
+        i += 1;
+
+        let Some((key_depth, content)) = read(line) else {
+            continue;
+        };
+        let Some((key, value)) = content.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+        let value = value.trim();
+
+        // A block scalar: the value is the indented lines that follow.
+        if value.starts_with('|') || value.starts_with('>') {
+            let mut parts: Vec<String> = Vec::new();
+            while i < lines.len() {
+                let Some((depth, next)) = read(lines[i]) else {
+                    break;
+                };
+                // Continuation lines sit deeper than the key they belong to.
+                if next.is_empty() || depth <= key_depth {
+                    break;
+                }
+                parts.push(next);
+                i += 1;
+            }
+            out.push((key.to_string(), parts.join("\n")));
+            continue;
+        }
+
+        let value = value.trim_matches('"');
+        // `${VAR}` and `${VAR:-default}` are compose's own syntax; a real
+        // deployment substitutes them, so stand in a value.
+        let value = if value.starts_with("${") {
+            if value.contains(":-}") {
+                ""
+            } else {
+                "sk-test"
+            }
+        } else {
+            value
+        };
+        out.push((key.to_string(), value.to_string()));
     }
     out
-}
-
-fn american_colon() -> char {
-    ':'
 }
 
 /// Make a parsed example self-contained so it can be validated offline.
@@ -475,6 +530,7 @@ fn the_shipped_env_example_only_uses_settings_that_exist() {
 }
 
 /// Read `KEY=value` pairs out of a dotenv file, ignoring commented examples.
+#[cfg(feature = "tls")]
 fn dotenv(text: &str) -> std::collections::BTreeMap<String, String> {
     text.lines()
         .map(str::trim)
@@ -486,6 +542,7 @@ fn dotenv(text: &str) -> std::collections::BTreeMap<String, String> {
 
 /// Resolve compose's `${VAR}`, `${VAR:-default}` and `${VAR:?message}` against
 /// a dotenv map, the way `docker compose` would.
+#[cfg(feature = "tls")]
 fn substitute(value: &str, env: &std::collections::BTreeMap<String, String>) -> Option<String> {
     let Some(inner) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) else {
         return Some(value.to_string());
@@ -507,10 +564,14 @@ fn substitute(value: &str, env: &std::collections::BTreeMap<String, String>) -> 
 /// The first run a real person has: copy both shipped files, fill in one
 /// provider key and the client key the compose file insists on, start it.
 ///
+/// Needs a TLS build: the key it fills in is a real provider's, and every
+/// remote provider is https.
+///
 /// This is the whole point of the pair being shipped together, and it is easy
 /// to break from either side -- a pool default naming a provider the user has
 /// no key for stops mini-router dead, and so does a half-filled custom
 /// provider. Both have happened.
+#[cfg(feature = "tls")]
 #[test]
 fn the_shipped_files_start_with_a_single_provider_key() {
     let dotenv_map = dotenv(include_str!("../.env.example"));
@@ -559,4 +620,58 @@ fn the_shipped_files_start_with_a_single_provider_key() {
             "{name}: the shipped files should not leave the port open"
         );
     }
+}
+
+/// The compose parser above is test scaffolding, but two bugs have already
+/// hidden in it, so it gets its own test rather than being trusted.
+#[test]
+fn the_compose_parser_reads_block_scalars_and_comments() {
+    let yaml = "\
+services:
+  mini-router:
+    image: x
+    environment:
+      PLAIN: value
+      QUOTED: \"1\"
+      FROM_ENV: ${SOMETHING:-}
+      REQUIRED: ${MUST_SET:?fill this in}
+      MINI_ROUTER_POOL_FAST: |
+        openai:gpt-4o-mini
+        anthropic:claude-haiku-4-5
+      # COMMENTED_PLAIN: example
+      # MINI_ROUTER_POOL_SMART: |
+      #   anthropic:claude-sonnet-4-5
+      #   openai:gpt-4o
+    ports:
+      - \"8080:8080\"
+";
+
+    let active: std::collections::BTreeMap<String, String> =
+        compose_environment_active(yaml).into_iter().collect();
+    assert_eq!(active.get("PLAIN").unwrap(), "value");
+    assert_eq!(active.get("QUOTED").unwrap(), "1", "quotes are stripped");
+    assert_eq!(active.get("FROM_ENV").unwrap(), "", "`:-` renders empty");
+    assert_eq!(active.get("REQUIRED").unwrap(), "sk-test", "`:?` stands in");
+    assert_eq!(
+        active.get("MINI_ROUTER_POOL_FAST").unwrap(),
+        "openai:gpt-4o-mini\nanthropic:claude-haiku-4-5",
+        "a block scalar keeps one member per line, in order"
+    );
+    assert!(
+        !active.contains_key("COMMENTED_PLAIN"),
+        "commented lines are not active"
+    );
+    assert!(
+        !active.contains_key("PORTS") && active.len() == 5,
+        "nothing outside the environment block leaks in: {active:#?}"
+    );
+
+    let all: std::collections::BTreeMap<String, String> =
+        compose_environment(yaml).into_iter().collect();
+    assert_eq!(all.get("COMMENTED_PLAIN").unwrap(), "example");
+    assert_eq!(
+        all.get("MINI_ROUTER_POOL_SMART").unwrap(),
+        "anthropic:claude-sonnet-4-5\nopenai:gpt-4o",
+        "a commented block scalar reads the same as an active one"
+    );
 }

@@ -551,10 +551,23 @@ where
         .map_err(|e| err(format!("{name}: {value:?} is not a number: {e}")))
 }
 
-/// Split a comma-separated list, ignoring blanks and surrounding space.
+/// Split a list written with commas, newlines, or both.
+///
+/// Newlines are accepted so a compose file can use a YAML block scalar and get
+/// one entry per line, in order, which reads far better than a long comma
+/// string for something like a pool:
+///
+/// ```yaml
+/// MINI_ROUTER_POOL_FAST: |
+///   openai:gpt-4o-mini
+///   anthropic:claude-haiku-4-5
+/// ```
+///
+/// A true YAML list is not an option there: a compose `environment:` value has
+/// to become a process environment variable, and those are strings.
 fn split_list(value: &str) -> Vec<String> {
     value
-        .split(',')
+        .split([',', '\n', '\r'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)

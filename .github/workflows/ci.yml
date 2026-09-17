@@ -57,6 +57,101 @@ jobs:
           ls -l target/release/mini-router
           echo "no-tls release binary: $(stat -c%s target/release/mini-router) bytes" >> "$GITHUB_STEP_SUMMARY"
 
+
+  # --------------------------------------------------------------------------
+  # Orange Pi Zero 3 profile: real arm64 hardware, squeezed to the board's
+  # shape. The H618 is a quad-core Cortex-A53 with 1/1.5/2/4 GB of LPDDR4, so
+  # the measurement runs in a container capped at 2 GB and 4 CPUs.
+  #
+  # This needs GitHub's arm64 hosted runners, which are free on public repos.
+  # On a private repo without a plan that includes them, either swap
+  # `runs-on` for a self-hosted arm64 box, or delete this job -- `arm64-qemu`
+  # below still proves the code is correct on arm64 without any ARM hardware.
+  # Do not swap this one to QEMU: emulation inflates RSS by ~11 MB of
+  # translation buffers, which would make every number here a fiction.
+  # --------------------------------------------------------------------------
+  arm64-footprint:
+    name: arm64 footprint (Orange Pi Zero 3 profile)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test on arm64
+        run: cargo test --all-features --locked
+
+      - name: Build the binary a user would ship to the board
+        run: cargo build --release --locked
+
+      - name: Measure under the board's constraints
+        env:
+          # ubuntu:24.04 matches the runner's glibc, so the binary built on
+          # the host runs unchanged inside the capped container.
+          IMAGE: ubuntu:24.04
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --memory=2g --memory-swap=2g --cpus=4 \
+            --volume "$PWD:/w" --workdir /w \
+            --env DEBIAN_FRONTEND=noninteractive \
+            "$IMAGE" bash -c '
+              apt-get update -qq && apt-get install -y -qq python3 >/dev/null
+              python3 scripts/perf.py \
+                --binary target/release/mini-router \
+                --concurrency 16 --rounds 4 \
+                --max-rss-mb 64 --max-growth-pct 25 \
+                --label "arm64, 2 GB / 4 CPU (Orange Pi Zero 3 profile)" \
+                --json perf-arm64.json \
+                --summary perf-arm64.md
+            '
+
+      - name: Publish the numbers
+        if: always()
+        run: cat perf-arm64.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-arm64
+          path: |
+            perf-arm64.json
+            perf-arm64.md
+          if-no-files-found: warn
+
+  # --------------------------------------------------------------------------
+  # arm64 correctness without any ARM hardware: cross-compile the test
+  # binaries on x86_64, then execute them as real aarch64 instructions under
+  # qemu-user. Catches anything genuinely architecture-dependent -- atomics,
+  # alignment, the hand-rolled RNG -- and keeps working on a private repo with
+  # no arm64 runners.
+  #
+  # Correctness only. It deliberately runs no benchmark: under emulation RSS
+  # includes QEMU's own translation buffers (measured: 15.3 MB idle against
+  # 4.1 MB native), so any footprint number from here would be meaningless.
+  # --------------------------------------------------------------------------
+  arm64-qemu:
+    name: arm64 correctness (emulated)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the cross toolchain and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
+
+      - name: Run the suite as aarch64
+        run: cargo test --all-features --locked --target aarch64-unknown-linux-gnu
+
   cross:
     name: cross-build / ${{ matrix.target }}
     runs-on: ubuntu-latest

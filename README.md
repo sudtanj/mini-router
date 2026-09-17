@@ -496,6 +496,40 @@ cargo fmt --check
 cargo test --no-default-features              # the no-TLS build
 ```
 
+### Measuring the footprint yourself
+
+`scripts/perf.py` starts a mock Anthropic provider, points a real mini-router
+at it, and fires concurrent OpenAI-shaped streaming requests — so every byte
+crosses the translator. Stdlib only, nothing to install:
+
+```sh
+cargo build --release
+python3 scripts/perf.py --binary target/release/mini-router
+```
+
+It fails the run if peak RSS exceeds `--max-rss-mb` or if RSS grows more than
+`--max-growth-pct` between rounds, which is the check that catches a response
+body being buffered instead of streamed.
+
+On the board itself, or over ssh to it, the same command gives you the real
+numbers for your hardware.
+
+### ARM in CI
+
+Two jobs cover the Orange Pi Zero 3, and they do different things on purpose:
+
+- **`arm64-footprint`** runs on GitHub's arm64 hosted runners — real hardware,
+  no emulation — and measures inside a container capped at **2 GB and 4 CPUs**
+  to match the board. Budgets are enforced, and the numbers land in the job
+  summary.
+- **`arm64-qemu`** cross-compiles the test binaries and executes them as real
+  aarch64 instructions under `qemu-user`. Correctness only, and it runs
+  anywhere, so ARM coverage survives even without ARM runners.
+
+The split is deliberate: under emulation QEMU's translation buffers show up in
+the same RSS, which measured **15.3 MB idle against 4.1 MB native**. Emulated
+runs prove the code works on the architecture; they cannot measure it.
+
 Minimum supported Rust version is **1.85**, checked in CI against the committed
 `Cargo.lock`.
 

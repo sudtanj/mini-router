@@ -21,6 +21,9 @@ USAGE:
 
 OPTIONS:
         --check            Print the resolved configuration and exit
+        --healthcheck      Probe a running mini-router's /healthz and exit 0
+                           if it answers. Exists so a container image needs no
+                           shell, curl or wget just to have a HEALTHCHECK.
     -l, --listen <ADDR>    Override MINI_ROUTER_LISTEN, e.g. 0.0.0.0:8080
     -h, --help             Print this help
     -V, --version          Print the version
@@ -92,11 +95,13 @@ EXAMPLE (docker compose)
 
 struct Args {
     check: bool,
+    healthcheck: bool,
     listen: Option<String>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
     let mut check = false;
+    let mut healthcheck = false;
     let mut listen = None;
 
     let mut argv = std::env::args().skip(1);
@@ -111,6 +116,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "--check" => check = true,
+            "--healthcheck" => healthcheck = true,
             "-c" | "--config" => {
                 return Err(
                     "mini-router has no configuration file: every setting is an environment \
@@ -127,7 +133,62 @@ fn parse_args() -> Result<Option<Args>, String> {
             other => return Err(format!("unknown argument {other:?}\n\n{USAGE}")),
         }
     }
-    Ok(Some(Args { check, listen }))
+    Ok(Some(Args {
+        check,
+        healthcheck,
+        listen,
+    }))
+}
+
+/// Ask a running mini-router whether it is alive.
+///
+/// Deliberately a hand-written HTTP/1.1 request over a plain socket: no
+/// runtime, no TLS, no client crate. That keeps the container image free of a
+/// shell and of `curl`/`wget`, which would otherwise exist only to satisfy
+/// `HEALTHCHECK`.
+fn healthcheck(listen_override: Option<&str>) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let listen = listen_override
+        .map(str::to_owned)
+        .or_else(|| std::env::var("MINI_ROUTER_LISTEN").ok())
+        .unwrap_or_else(|| "0.0.0.0:8080".to_string());
+
+    // A wildcard bind is not an address to connect to; loopback is.
+    let port = listen
+        .rsplit(':')
+        .next()
+        .ok_or_else(|| format!("cannot read a port out of {listen:?}"))?;
+    let target = format!("127.0.0.1:{port}");
+
+    let timeout = Duration::from_secs(5);
+    let addr = target
+        .parse()
+        .map_err(|e| format!("{target:?} is not an address: {e}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("cannot connect to {target}: {e}"))?;
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .map_err(|e| format!("cannot send request: {e}"))?;
+
+    let mut buf = [0u8; 64];
+    let n = stream
+        .read(&mut buf)
+        .map_err(|e| format!("no response: {e}"))?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    if head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(format!(
+            "/healthz answered {:?}",
+            head.lines().next().unwrap_or("nothing")
+        ))
+    }
 }
 
 fn print_check(cfg: &Config, sources: &BTreeMap<String, Source>) {
@@ -195,6 +256,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if args.healthcheck {
+        return match healthcheck(args.listen.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mini-router: unhealthy: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let (mut cfg, sources) = match env::load(&env::vars()) {
         Ok(r) => (r.config, r.sources),

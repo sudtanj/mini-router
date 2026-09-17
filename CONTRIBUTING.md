@@ -37,8 +37,19 @@ cargo test --all-features
 cargo test --no-default-features     # the no-TLS build must keep working
 ```
 
-CI runs all of the above plus MSRV (1.85) and cross-builds for `aarch64` and
-`armv7`. It will not pass if `cargo fmt --check` fails.
+If you touched anything on the request or response path, check the footprint
+too:
+
+```sh
+cargo build --release && python3 scripts/perf.py --binary target/release/mini-router
+```
+
+CI runs all of the above plus MSRV (1.85), cross-builds for `aarch64` and
+`armv7`, the test suite executed as aarch64 under QEMU, and the footprint
+harness on real arm64 hardware capped to an Orange Pi Zero 3's 2 GB and 4 CPUs.
+It will not pass if `cargo fmt --check` fails, if peak RSS exceeds its budget,
+or if RSS grows across rounds -- that last one is how a buffered response body
+gets caught.
 
 ## Good first contributions
 

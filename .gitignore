@@ -2,6 +2,10 @@
 **/*.rs.bk
 *.pdb
 
+# Perf harness output
+perf-*.json
+perf-*.md
+
 # Local secrets. There is no config file to ignore: mini-router is configured
 # entirely from the environment.
 .env

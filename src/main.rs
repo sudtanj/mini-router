@@ -1,10 +1,12 @@
 //! mini-router entry point.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use mini_router::config::Config;
+use mini_router::config::{Config, ConfigError};
+use mini_router::env::{self, Source};
 use mini_router::state::{init_crypto, AppState};
 use mini_router::{health, router, version_line};
 
@@ -15,30 +17,93 @@ mini-router -- one OpenAI- and Anthropic-compatible endpoint over every
 USAGE:
     mini-router [OPTIONS]
 
+    A config file is optional. With none, mini-router configures itself from
+    the environment, which is the intended way to run it under Docker.
+
 OPTIONS:
-    -c, --config <PATH>    Configuration file (default: ./mini-router.toml,
-                           or $MINI_ROUTER_CONFIG)
-        --check            Validate the configuration and exit
-    -l, --listen <ADDR>    Override server.listen, e.g. 0.0.0.0:8080
+    -c, --config <PATH>    Configuration file. Without this, ./mini-router.toml
+                           or $MINI_ROUTER_CONFIG is used if it exists, and
+                           otherwise the environment is the whole config.
+        --check            Print the resolved configuration and exit
+    -l, --listen <ADDR>    Override the listen address, e.g. 0.0.0.0:8080
     -h, --help             Print this help
     -V, --version          Print the version
 
-ENVIRONMENT:
-    MINI_ROUTER_CONFIG     Default configuration path
-    MINI_ROUTER_LOG        Log level (error|warn|info|debug|trace), overrides
-                           server.log_level
+ENVIRONMENT
+    Settings from the environment always override the config file.
+
+  Providers -- the zero-config path is a key on its own:
+    OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
+    DEEPSEEK_API_KEY, MISTRAL_API_KEY, TOGETHER_API_KEY, XAI_API_KEY,
+    GEMINI_API_KEY, CEREBRAS_API_KEY
+        Any of these registers that provider with its usual URL and protocol.
+        Only applies when nothing else is configured; MINI_ROUTER_AUTODETECT
+        forces it on or off.
+
+  Providers -- anything else, or to override a well-known one:
+    MINI_ROUTER_PROVIDER_<NAME>_URL              https://host/v1
+    MINI_ROUTER_PROVIDER_<NAME>_PROTOCOL         openai | anthropic
+    MINI_ROUTER_PROVIDER_<NAME>_API_KEY          the key itself
+    MINI_ROUTER_PROVIDER_<NAME>_API_KEY_ENV      name of the var holding it
+    MINI_ROUTER_PROVIDER_<NAME>_MAX_CONCURRENCY  in-flight requests
+    MINI_ROUTER_PROVIDER_<NAME>_WEIGHT           for the weighted strategy
+    MINI_ROUTER_PROVIDER_<NAME>_MODELS           a,b,c (default: discover)
+    MINI_ROUTER_PROVIDER_<NAME>_FALLBACK_ONLY    true | false
+    MINI_ROUTER_PROVIDER_<NAME>_HEADERS          k=v,k=v
+    MINI_ROUTER_PROVIDER_ORDER                   priority order of providers
+        <NAME> is uppercase; underscores in it become dashes.
+
+  Pools -- one client-facing model name over several provider models:
+    MINI_ROUTER_POOL_<NAME>              provider:model,provider:model
+    MINI_ROUTER_POOL_<NAME>_STRATEGY     overrides MINI_ROUTER_STRATEGY
+    MINI_ROUTER_POOL_<NAME>_WEIGHTS      one per member
+    MINI_ROUTER_POOL_<NAME>_DESCRIPTION  shown in the catalogue
+
+  Routing:
+    MINI_ROUTER_STRATEGY          priority | round-robin | least-conn |
+                                  weighted | p2c-latency
+    MINI_ROUTER_SPILLOVER         any-error | status-list
+    MINI_ROUTER_RETRY_ON_STATUS   429,500,503 (status-list mode only)
+    MINI_ROUTER_MAX_ATTEMPTS      0 = try every candidate
+    MINI_ROUTER_ALIASES           name=target,name=target
+
+  Server:
+    MINI_ROUTER_LISTEN            0.0.0.0:8080
+    MINI_ROUTER_WORKER_THREADS    2
+    MINI_ROUTER_REQUIRE_AUTH      true | false
+    MINI_ROUTER_API_KEYS          keys your own clients present
+    MINI_ROUTER_API_KEY_ENVS      vars holding those keys
+    MINI_ROUTER_ADMIN             false disables GET /admin/upstreams
+    MINI_ROUTER_METRICS           false disables GET /metrics
+    MINI_ROUTER_LOG               error | warn | info | debug | trace
+    MINI_ROUTER_LOG_LEVEL         same, from config rather than runtime
+    MINI_ROUTER_MAX_BODY_BYTES, MINI_ROUTER_MAX_TRANSLATE_BYTES,
+    MINI_ROUTER_HEADER_TIMEOUT_SECS, MINI_ROUTER_QUEUE_TIMEOUT_SECS,
+    MINI_ROUTER_POOL_IDLE_TIMEOUT_SECS
+
+  Health and translation:
+    MINI_ROUTER_HEALTH_INTERVAL_SECS, MINI_ROUTER_HEALTH_TIMEOUT_SECS,
+    MINI_ROUTER_HEALTH_PATH, MINI_ROUTER_FAILURE_THRESHOLD,
+    MINI_ROUTER_SUCCESS_THRESHOLD, MINI_ROUTER_COOLDOWN_SECS,
+    MINI_ROUTER_MAX_COOLDOWN_SECS, MINI_ROUTER_DEFAULT_MAX_TOKENS,
+    MINI_ROUTER_ANTHROPIC_VERSION
+
+EXAMPLE (docker compose)
+    environment:
+      - OPENAI_API_KEY=sk-...
+      - ANTHROPIC_API_KEY=sk-ant-...
+      - MINI_ROUTER_POOL_FAST=openai:gpt-4o-mini,anthropic:claude-haiku-4-5
 ";
 
 struct Args {
-    config: PathBuf,
+    /// None means "look in the usual places, and fall back to the environment".
+    config: Option<PathBuf>,
     check: bool,
     listen: Option<String>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut config = std::env::var("MINI_ROUTER_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("mini-router.toml"));
+    let mut config: Option<PathBuf> = None;
     let mut check = false;
     let mut listen = None;
 
@@ -55,10 +120,11 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--check" => check = true,
             "-c" | "--config" => {
-                config = argv
-                    .next()
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--config needs a path".to_string())?;
+                config = Some(
+                    argv.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--config needs a path".to_string())?,
+                );
             }
             "-l" | "--listen" => {
                 listen = Some(
@@ -76,6 +142,86 @@ fn parse_args() -> Result<Option<Args>, String> {
     }))
 }
 
+/// Load the config file if there is one, then let the environment override it.
+///
+/// A missing file is only an error when it was asked for by name: running with
+/// nothing but environment variables is the normal Docker case, not a mistake.
+fn resolve_config(
+    explicit: Option<&Path>,
+) -> Result<(Config, BTreeMap<String, Source>, String), ConfigError> {
+    let (base, origin) = match explicit {
+        Some(path) => (Config::load(path)?, path.display().to_string()),
+        None => {
+            let candidate = std::env::var("MINI_ROUTER_CONFIG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("mini-router.toml"));
+            if candidate.is_file() {
+                (Config::load(&candidate)?, candidate.display().to_string())
+            } else {
+                (Config::default(), "environment only".to_string())
+            }
+        }
+    };
+    let resolved = env::apply(base, &env::vars())?;
+    Ok((resolved.config, resolved.sources, origin))
+}
+
+fn print_check(cfg: &Config, sources: &BTreeMap<String, Source>, origin: &str) {
+    println!(
+        "configuration ok ({origin}): {} provider(s), {} pool(s), strategy {}, spillover {}",
+        cfg.upstreams.len(),
+        cfg.pools.len(),
+        cfg.balance.strategy,
+        match cfg.balance.spillover {
+            mini_router::config::Spillover::AnyError => "any-error",
+            mini_router::config::Spillover::StatusList => "status-list",
+        }
+    );
+    for up in &cfg.upstreams {
+        let source = sources
+            .get(&up.name)
+            .map(Source::to_string)
+            .unwrap_or_else(|| "file".into());
+        println!(
+            "  provider  {:<14} {:<10} [{:<4}] {}{}",
+            up.name,
+            up.protocol.to_string(),
+            source,
+            up.url,
+            if up.resolve_key().is_some() {
+                ""
+            } else {
+                "   !! no api key resolved"
+            }
+        );
+    }
+    for (name, pool) in &cfg.pools {
+        let members: Vec<String> = pool
+            .members
+            .iter()
+            .map(|m| format!("{}:{}", m.upstream, m.model))
+            .collect();
+        println!("  pool      {:<14} {}", name, members.join("  ->  "));
+    }
+    for (from, to) in &cfg.alias {
+        println!("  alias     {:<14} ->  {}", from, to);
+    }
+    println!(
+        "  endpoints /v1/chat/completions  /v1/messages  /v1/models  /healthz  /readyz{}{}",
+        if cfg.server.metrics { "  /metrics" } else { "" },
+        if cfg.server.admin {
+            "  /admin/upstreams"
+        } else {
+            ""
+        }
+    );
+    if cfg.server.auth.require_auth {
+        println!("  auth      required ({} key(s))", cfg.client_keys().len());
+    } else {
+        println!("  auth      OPEN -- anyone who can reach the port can spend your credits");
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(Some(a)) => a,
@@ -86,8 +232,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut cfg = match Config::load(&args.config) {
-        Ok(c) => c,
+    let (mut cfg, sources, origin) = match resolve_config(args.config.as_deref()) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("mini-router: configuration error: {e}");
             return ExitCode::FAILURE;
@@ -105,33 +251,7 @@ fn main() -> ExitCode {
     }
 
     if args.check {
-        println!(
-            "configuration ok: {} provider(s), {} pool(s), strategy {}",
-            cfg.upstreams.len(),
-            cfg.pools.len(),
-            cfg.balance.strategy
-        );
-        for up in &cfg.upstreams {
-            println!(
-                "  provider {:<16} {:<10} {}{}",
-                up.name,
-                up.protocol.to_string(),
-                up.url,
-                if up.resolve_key().is_some() {
-                    ""
-                } else {
-                    "  (no api key resolved)"
-                }
-            );
-        }
-        for (name, pool) in &cfg.pools {
-            let members: Vec<String> = pool
-                .members
-                .iter()
-                .map(|m| format!("{}:{}", m.upstream, m.model))
-                .collect();
-            println!("  pool     {:<16} {}", name, members.join(" -> "));
-        }
+        print_check(&cfg, &sources, &origin);
         return ExitCode::SUCCESS;
     }
 
@@ -197,6 +317,13 @@ async fn run(cfg: Config, workers: usize) -> Result<(), Box<dyn std::error::Erro
             pool = %name,
             members = pool.members.len(),
             "pool registered"
+        );
+    }
+
+    if !state.cfg.server.auth.require_auth {
+        tracing::warn!(
+            "auth is off: anyone who can reach {listen} can spend your provider credits. \
+             Set MINI_ROUTER_REQUIRE_AUTH=true and MINI_ROUTER_API_KEYS=..."
         );
     }
 

@@ -68,6 +68,14 @@ pub struct ServerConfig {
     /// Log level: error, warn, info, debug, trace.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Serve `GET /admin/upstreams`. It is a JSON endpoint, not a dashboard --
+    /// there is no UI anywhere in mini-router -- but turning it off removes one
+    /// more thing listening.
+    #[serde(default = "default_true")]
+    pub admin: bool,
+    /// Serve `GET /metrics` (Prometheus text).
+    #[serde(default = "default_true")]
+    pub metrics: bool,
     #[serde(default)]
     pub auth: AuthConfig,
 }
@@ -83,6 +91,8 @@ impl Default for ServerConfig {
             queue_timeout_secs: default_queue_timeout(),
             pool_idle_timeout_secs: default_pool_idle_timeout(),
             log_level: default_log_level(),
+            admin: true,
+            metrics: true,
             auth: AuthConfig::default(),
         }
     }
@@ -341,6 +351,12 @@ pub struct UpstreamConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(String);
 
+impl ConfigError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -357,6 +373,11 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Build configuration from the environment alone.
+    pub fn from_env() -> Result<Self, ConfigError> {
+        crate::env::apply(Config::default(), &crate::env::vars()).map(|r| r.config)
+    }
+
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
@@ -367,7 +388,10 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.upstreams.is_empty() {
             return Err(ConfigError(
-                "no [[upstream]] configured: mini-router has nothing to route to".into(),
+                "no providers configured: mini-router has nothing to route to.\n\
+                 Set a well-known key (OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, ...),\n\
+                 or MINI_ROUTER_PROVIDER_<NAME>_URL, or add an [[upstream]] block to a config file."
+                    .into(),
             ));
         }
         let mut seen = BTreeMap::new();
@@ -498,6 +522,23 @@ impl Config {
 }
 
 impl UpstreamConfig {
+    /// A provider with defaults everywhere except its name and URL. Used when
+    /// building configuration from the environment.
+    pub fn stub(name: &str, url: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            protocol: Protocol::default(),
+            api_key: None,
+            api_key_env: None,
+            weight: default_weight(),
+            max_concurrency: default_max_concurrency(),
+            models: Vec::new(),
+            fallback_only: false,
+            headers: BTreeMap::new(),
+        }
+    }
+
     /// The API key for this provider, if any.
     pub fn resolve_key(&self) -> Option<String> {
         if let Some(var) = &self.api_key_env {
@@ -576,6 +617,9 @@ fn default_cooldown() -> u64 {
 }
 fn default_max_cooldown() -> u64 {
     300
+}
+fn default_true() -> bool {
+    true
 }
 fn default_weight() -> u32 {
     1

@@ -54,6 +54,29 @@ First release.
 - Model aliases, which may point at a pool.
 - `fallback_only` providers, held back until nothing else serves the model.
 
+**Configuration from the environment**
+
+- Every setting is an environment variable, so a `docker compose` file with an
+  `environment:` block is a complete deployment and no config file is needed.
+- Zero-config providers: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`,
+  `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`,
+  `TOGETHER_API_KEY`, `XAI_API_KEY`, `GEMINI_API_KEY` and `CEREBRAS_API_KEY`
+  each register that provider with the right URL and dialect. Autodetection
+  only runs when nothing else is configured, so a key belonging to another tool
+  in the same container cannot quietly add a provider.
+- `MINI_ROUTER_PROVIDER_<NAME>_*` defines anything else, or overrides a
+  well-known provider's URL.
+- `MINI_ROUTER_POOL_<NAME>=provider:model,provider:model` defines a pool in one
+  variable; `_STRATEGY`, `_WEIGHTS` and `_DESCRIPTION` refine it.
+- A TOML file still works and the environment overrides it, so an image can
+  ship a base config that a deployment adjusts.
+- An unrecognised or malformed variable is a startup error naming the variable
+  and what was expected, never a silent default.
+- `--check` prints the resolved setup, including where each provider came from
+  and whether its key resolved.
+- `docker-compose.yml`, `.env.example` and a `.dockerignore` ship with the repo;
+  the Dockerfile and systemd unit need no config file.
+
 **Operations**
 
 - Client API keys accepted as `Authorization: Bearer` or `x-api-key`, compared
@@ -65,6 +88,10 @@ First release.
 - Prometheus metrics at `/metrics`, plus `/healthz`, `/readyz` and a JSON view
   of providers and pools at `/admin/upstreams`.
 - Extra per-provider request headers, for providers that require them.
+- `MINI_ROUTER_ADMIN=false` and `MINI_ROUTER_METRICS=false` remove those routes
+  outright (404, not 401). `/healthz` and `/readyz` always remain. There is no
+  web UI, dashboard or static asset anywhere in mini-router; compiling both
+  endpoints out entirely would save 23 KB of a 2.54 MB binary.
 - Hardened systemd unit and a Dockerfile in `deploy/`.
 - Optional `tls` feature, on by default; turning it off drops about a megabyte
   for an all-local-provider deployment.

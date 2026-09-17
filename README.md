@@ -58,69 +58,192 @@ costs the same as a one-line one.
 
 ## Quick start
 
+Everything is environment variables. There is no config file to write unless
+you want one.
+
+```yaml
+# docker-compose.yml
+services:
+  mini-router:
+    image: mini-router
+    ports: ["8080:8080"]
+    environment:
+      # A key on its own is enough: mini-router knows these providers.
+      OPENAI_API_KEY: sk-...
+      ANTHROPIC_API_KEY: sk-ant-...
+
+      # One name over both, first one wins, failures fall through.
+      MINI_ROUTER_POOL_FAST: openai:gpt-4o-mini,anthropic:claude-haiku-4-5
+
+      MINI_ROUTER_REQUIRE_AUTH: "true"
+      MINI_ROUTER_API_KEYS: sk-your-own-key
+```
+
 ```sh
-git clone https://github.com/sudtanj/mini-router
-cd mini-router
+cp .env.example .env     # put your provider keys in it
+docker compose up -d
+```
+
+The repo ships a working `docker-compose.yml` and `.env.example`. Or without
+Docker:
+
+```sh
 cargo build --release
-
-cp mini-router.example.toml mini-router.toml
-$EDITOR mini-router.toml
-
-export OPENAI_API_KEY=sk-...
-export ANTHROPIC_API_KEY=sk-ant-...
-./target/release/mini-router --config mini-router.toml
+OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-... \
+MINI_ROUTER_POOL_FAST=openai:gpt-4o-mini,anthropic:claude-haiku-4-5 \
+  ./target/release/mini-router
 ```
 
-A configuration that does something useful:
-
-```toml
-[[upstream]]
-name = "openai"
-url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-
-[[upstream]]
-name = "anthropic"
-url = "https://api.anthropic.com/v1"
-protocol = "anthropic"
-api_key_env = "ANTHROPIC_API_KEY"
-
-[pool.fast]
-members = [
-  { upstream = "openai",    model = "gpt-4o-mini" },
-  { upstream = "anthropic", model = "claude-haiku-4-5" },
-]
-```
-
-Now every client can use it, whichever SDK it was written against:
+Now every client works, whichever SDK it was written against:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://pi.local:8080/v1", api_key="not-needed")
+client = OpenAI(base_url="http://pi.local:8080/v1", api_key="sk-your-own-key")
 client.chat.completions.create(model="fast", messages=[{"role": "user", "content": "hi"}])
 
 from anthropic import Anthropic
-client = Anthropic(base_url="http://pi.local:8080", api_key="not-needed")
+client = Anthropic(base_url="http://pi.local:8080", api_key="sk-your-own-key")
 client.messages.create(model="fast", max_tokens=256,
                        messages=[{"role": "user", "content": "hi"}])
 ```
 
-Both of those calls can end up at the *same* provider. `fast` resolves to
-whichever member is healthy, and the answer is reshaped to match whichever SDK
-asked.
+Both calls can land on the *same* provider. `fast` resolves to whichever member
+is healthy, and the answer is reshaped to match whichever SDK asked.
 
 ```sh
 curl http://localhost:8080/v1/chat/completions \
+  -H 'authorization: Bearer sk-your-own-key' \
   -H 'content-type: application/json' \
   -d '{"model": "fast", "stream": true,
        "messages": [{"role": "user", "content": "why is the sky blue?"}]}'
 ```
 
-Check the configuration without starting anything:
+### Check before you start
+
+`--check` prints the whole resolved setup — where each provider came from, and
+what is missing:
+
+```
+$ mini-router --check
+configuration ok (environment only): 2 provider(s), 1 pool(s), strategy priority, spillover any-error
+  provider  anthropic      anthropic  [auto] https://api.anthropic.com/v1
+  provider  openai         openai     [auto] https://api.openai.com/v1
+  pool      fast           openai:gpt-4o-mini  ->  anthropic:claude-haiku-4-5
+  alias     gpt-3.5-turbo  ->  fast
+  endpoints /v1/chat/completions  /v1/messages  /v1/models  /healthz  /readyz  /metrics
+  auth      OPEN -- anyone who can reach the port can spend your credits
+```
+
+A misspelled variable is an error, not a silent default:
+
+```
+$ MINI_ROUTER_STRATEGIE=priority mini-router --check
+mini-router: configuration error: unrecognised setting(s): MINI_ROUTER_STRATEGIE.
+Run `mini-router --help` for the list
+```
+
+## Configuration
+
+### Providers
+
+A key on its own registers a provider mini-router already knows, with the right
+URL and the right dialect:
+
+| Variable | Provider | Dialect |
+|---|---|---|
+| `OPENAI_API_KEY` | api.openai.com | openai |
+| `ANTHROPIC_API_KEY` | api.anthropic.com | anthropic |
+| `GROQ_API_KEY` | api.groq.com | openai |
+| `OPENROUTER_API_KEY` | openrouter.ai | openai |
+| `DEEPSEEK_API_KEY` | api.deepseek.com | openai |
+| `MISTRAL_API_KEY` | api.mistral.ai | openai |
+| `TOGETHER_API_KEY` | api.together.xyz | openai |
+| `XAI_API_KEY` | api.x.ai | openai |
+| `GEMINI_API_KEY` | generativelanguage.googleapis.com | openai |
+| `CEREBRAS_API_KEY` | api.cerebras.ai | openai |
+
+Those URLs are defaults, not constraints — override any of them with
+`..._URL` below. Autodetection only runs when nothing else is configured, so a
+stray `OPENAI_API_KEY` belonging to another tool in the same container cannot
+quietly add a provider; `MINI_ROUTER_AUTODETECT=on|off` forces the question.
+
+Anything else — a self-hosted server, a gateway, a provider not on that list —
+is spelled out. `<NAME>` is uppercase, and underscores in it become dashes:
+
+| Variable | |
+|---|---|
+| `MINI_ROUTER_PROVIDER_<NAME>_URL` | `https://host/v1` |
+| `MINI_ROUTER_PROVIDER_<NAME>_PROTOCOL` | `openai` or `anthropic` |
+| `MINI_ROUTER_PROVIDER_<NAME>_API_KEY` | the key itself |
+| `MINI_ROUTER_PROVIDER_<NAME>_API_KEY_ENV` | name of the variable holding it |
+| `MINI_ROUTER_PROVIDER_<NAME>_MAX_CONCURRENCY` | in-flight requests |
+| `MINI_ROUTER_PROVIDER_<NAME>_WEIGHT` | for the weighted strategy |
+| `MINI_ROUTER_PROVIDER_<NAME>_MODELS` | `a,b,c` — default is to discover |
+| `MINI_ROUTER_PROVIDER_<NAME>_FALLBACK_ONLY` | `true`/`false` |
+| `MINI_ROUTER_PROVIDER_<NAME>_HEADERS` | `k=v,k=v` |
+| `MINI_ROUTER_PROVIDER_ORDER` | priority order; default is alphabetical |
+
+```yaml
+MINI_ROUTER_PROVIDER_LOCAL_URL: http://ollama:11434/v1
+MINI_ROUTER_PROVIDER_LOCAL_MAX_CONCURRENCY: "1"
+```
+
+### Pools and routing
+
+| Variable | |
+|---|---|
+| `MINI_ROUTER_POOL_<NAME>` | `provider:model,provider:model`, in priority order |
+| `MINI_ROUTER_POOL_<NAME>_STRATEGY` | overrides the global strategy |
+| `MINI_ROUTER_POOL_<NAME>_WEIGHTS` | one per member |
+| `MINI_ROUTER_POOL_<NAME>_DESCRIPTION` | shown in the catalogue |
+| `MINI_ROUTER_STRATEGY` | `priority`, `round-robin`, `least-conn`, `weighted`, `p2c-latency` |
+| `MINI_ROUTER_SPILLOVER` | `any-error` or `status-list` |
+| `MINI_ROUTER_RETRY_ON_STATUS` | `429,500,503` — `status-list` mode only |
+| `MINI_ROUTER_MAX_ATTEMPTS` | `0` = try every candidate |
+| `MINI_ROUTER_ALIASES` | `gpt-3.5-turbo=fast,gpt-4o-mini=fast` |
+
+Only the first colon separates, so a model id may contain more:
+`MINI_ROUTER_POOL_TINY=local:qwen2.5:0.5b` is one member.
+
+### Server
+
+| Variable | Default | |
+|---|---|---|
+| `MINI_ROUTER_LISTEN` | `0.0.0.0:8080` | |
+| `MINI_ROUTER_WORKER_THREADS` | `2` | `0` = one per core |
+| `MINI_ROUTER_REQUIRE_AUTH` | `false` | |
+| `MINI_ROUTER_API_KEYS` | — | keys your clients present |
+| `MINI_ROUTER_API_KEY_ENVS` | — | variables holding those keys |
+| `MINI_ROUTER_ADMIN` | `true` | `false` removes `/admin/upstreams` |
+| `MINI_ROUTER_METRICS` | `true` | `false` removes `/metrics` |
+| `MINI_ROUTER_LOG` | `info` | |
+| `MINI_ROUTER_MAX_BODY_BYTES` | 8 MiB | |
+| `MINI_ROUTER_MAX_TRANSLATE_BYTES` | 8 MiB | non-streamed translated responses |
+| `MINI_ROUTER_HEADER_TIMEOUT_SECS` | `120` | not a limit on generation time |
+| `MINI_ROUTER_QUEUE_TIMEOUT_SECS` | `60` | |
+| `MINI_ROUTER_POOL_IDLE_TIMEOUT_SECS` | `90` | |
+
+Health and translation: `MINI_ROUTER_HEALTH_INTERVAL_SECS`,
+`MINI_ROUTER_HEALTH_TIMEOUT_SECS`, `MINI_ROUTER_HEALTH_PATH`,
+`MINI_ROUTER_FAILURE_THRESHOLD`, `MINI_ROUTER_SUCCESS_THRESHOLD`,
+`MINI_ROUTER_COOLDOWN_SECS`, `MINI_ROUTER_MAX_COOLDOWN_SECS`,
+`MINI_ROUTER_DEFAULT_MAX_TOKENS`, `MINI_ROUTER_ANTHROPIC_VERSION`.
+
+`mini-router --help` lists all of them.
+
+### A config file, if you prefer one
+
+A TOML file still works, and the environment overrides it — so an image can
+ship a base config and a deployment can adjust it. See
+[`mini-router.example.toml`](mini-router.example.toml), which documents every
+setting inline.
 
 ```sh
-mini-router --config mini-router.toml --check
+mini-router --config mini-router.toml
 ```
+
+Without `-c`, `./mini-router.toml` or `$MINI_ROUTER_CONFIG` is used if it
+exists; otherwise the environment is the whole configuration.
 
 ## Pools
 
@@ -251,12 +374,13 @@ nothing else does. To be explicit, prefix with `/openai/...` or
 
 Your clients get one key; each provider gets its own.
 
-```toml
-[server.auth]
-require_auth = true
-api_keys = ["sk-choose-something-long"]
-api_key_envs = ["MINI_ROUTER_CLIENT_KEY"]   # or keep it out of the file
+```yaml
+MINI_ROUTER_REQUIRE_AUTH: "true"
+MINI_ROUTER_API_KEYS: sk-choose-something-long     # comma-separated for several
 ```
+
+mini-router warns on startup when auth is off, because an open port here is an
+open line to your provider bills.
 
 Client keys are accepted as `Authorization: Bearer` *or* `x-api-key`, so both
 SDKs work, and are compared in constant time. The client's credential is never
@@ -289,21 +413,42 @@ cargo build --release --target aarch64-unknown-linux-gnu
 scp target/aarch64-unknown-linux-gnu/release/mini-router orangepi@pi.local:
 ```
 
-Install as a service:
+Install as a service. The unit reads its whole configuration from
+`/etc/mini-router/env`, so there is no config file to manage:
 
 ```sh
 sudo install -m755 mini-router /usr/local/bin/
-sudo install -m644 -D mini-router.toml /etc/mini-router/mini-router.toml
-sudo install -m600 -D /dev/null /etc/mini-router/env   # provider keys go here
 sudo install -m644 deploy/mini-router.service /etc/systemd/system/
+sudo install -m600 -D /dev/null /etc/mini-router/env
+sudo $EDITOR /etc/mini-router/env       # OPENAI_API_KEY=..., MINI_ROUTER_POOL_FAST=...
 sudo systemctl enable --now mini-router
 ```
 
-The unit in `deploy/` runs as a transient unprivileged user with a hardened
-sandbox and `MemoryMax=64M` — ten times what it has ever needed. Put the
-provider keys in `/etc/mini-router/env` (`OPENAI_API_KEY=...`, one per line,
-mode 600) and reference them with `api_key_env`, so the config file stays safe
-to commit. There is a `deploy/Dockerfile` too.
+It runs as a transient unprivileged user in a hardened sandbox with
+`MemoryMax=64M` — ten times what it has ever needed.
+
+Or with Docker, which is the same thing in fewer steps:
+
+```sh
+docker compose up -d
+```
+
+## What it does not have
+
+No web UI, no dashboard, no admin console, no static assets, no JavaScript.
+The two observability endpoints are:
+
+- `GET /metrics` — Prometheus text
+- `GET /admin/upstreams` — JSON
+
+Both are switchable off with `MINI_ROUTER_METRICS=false` and
+`MINI_ROUTER_ADMIN=false`, which removes the routes outright (they return 404,
+not 401). `/healthz` and `/readyz` always stay, because a container runtime
+needs something to probe.
+
+For what it is worth, compiling both out entirely saves **23 KB of 2.54 MB** —
+under 1%. Turning them off is worth doing to shrink what is listening, not to
+shrink the binary.
 
 ## Metrics
 
@@ -353,7 +498,7 @@ low `spilled_out_total` is the system working as intended.
 ## Development
 
 ```sh
-cargo test                                    # 127 tests
+cargo test                                    # 164 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo test --no-default-features              # the no-TLS build
@@ -365,8 +510,9 @@ Minimum supported Rust version is **1.85**, checked in CI against the committed
 The integration tests run real HTTP against mock providers of both dialects on
 ephemeral ports, and cover the whole four-way matrix, streaming in both
 directions, tool calls across dialects, spillover on every error class,
-`Retry-After` parking, per-provider credentials, pools and the catalogue.
-`tests/support/mod.rs` has the harness.
+`Retry-After` parking, per-provider credentials, pools, the catalogue, and a
+router configured purely from environment variables. `tests/support/mod.rs` has
+the harness.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

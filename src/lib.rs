@@ -56,6 +56,7 @@ pub mod admin;
 pub mod auth;
 pub mod balance;
 pub mod config;
+pub mod env;
 pub mod error;
 pub mod health;
 pub mod metrics;
@@ -80,13 +81,18 @@ pub use state::{AppState, SharedState};
 /// there rather than in the route table is what lets both SDKs point at the
 /// same port and lets an endpoint we have never heard of still be forwarded.
 pub fn router(state: SharedState) -> Router {
-    Router::new()
+    // Liveness and readiness always exist: a container runtime needs something
+    // to probe, and they are two lines each.
+    let mut app = Router::new()
         .route("/healthz", get(admin::healthz))
-        .route("/readyz", get(admin::readyz))
-        .route("/metrics", get(admin::metrics))
-        .route("/admin/upstreams", get(admin::upstreams))
-        .fallback(any(proxy::gateway))
-        .with_state(state)
+        .route("/readyz", get(admin::readyz));
+    if state.cfg.server.metrics {
+        app = app.route("/metrics", get(admin::metrics));
+    }
+    if state.cfg.server.admin {
+        app = app.route("/admin/upstreams", get(admin::upstreams));
+    }
+    app.fallback(any(proxy::gateway)).with_state(state)
 }
 
 /// The banner printed at startup, also used by `--version`.

@@ -5,3 +5,4 @@
 # Local configuration and secrets
 mini-router.toml
 .env
+.env.local

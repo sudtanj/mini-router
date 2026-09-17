@@ -481,6 +481,26 @@ pub async fn start_router(config_toml: &str) -> SocketAddr {
     addr
 }
 
+/// Start the router from environment variables alone -- the docker-compose
+/// path -- without touching the process environment.
+pub async fn start_router_from_env(pairs: &[(&str, &str)]) -> SocketAddr {
+    let vars: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+    let resolved = mini_router::env::apply(Config::default(), &vars)
+        .unwrap_or_else(|e| panic!("env config should resolve: {e}"));
+    let state = Arc::new(AppState::new(resolved.config));
+    mini_router::health::spawn_probes(state.clone());
+    let app = mini_router::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    addr
+}
+
 pub type TestClient = Client<HttpConnector, Body>;
 
 pub fn client() -> TestClient {

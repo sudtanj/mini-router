@@ -1058,3 +1058,90 @@ async fn unknown_paths_and_oversized_bodies_are_rejected() {
     assert_eq!(huge.status, 413);
     assert_eq!(p.hits(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Configured entirely from the environment (the docker-compose path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_router_configured_only_by_environment_variables_works() {
+    let a = start_mock("openai", Openai, &["gpt-4o-mini"]).await;
+    let b = start_mock("anthropic", Anthropic, &["claude-haiku-4-5"]).await;
+
+    // Exactly what would sit under `environment:` in a compose file.
+    let addr = start_router_from_env(&[
+        ("MINI_ROUTER_PROVIDER_OPENAI_URL", &a.base_url()),
+        ("MINI_ROUTER_PROVIDER_OPENAI_API_KEY", "sk-openai-secret"),
+        ("MINI_ROUTER_PROVIDER_ANTHROPIC_URL", &b.base_url()),
+        ("MINI_ROUTER_PROVIDER_ANTHROPIC_PROTOCOL", "anthropic"),
+        (
+            "MINI_ROUTER_PROVIDER_ANTHROPIC_API_KEY",
+            "sk-anthropic-secret",
+        ),
+        (
+            "MINI_ROUTER_POOL_FAST",
+            "openai:gpt-4o-mini,anthropic:claude-haiku-4-5",
+        ),
+        ("MINI_ROUTER_ALIASES", "gpt-3.5-turbo=fast"),
+        ("MINI_ROUTER_REQUIRE_AUTH", "true"),
+        ("MINI_ROUTER_API_KEYS", "sk-client"),
+        ("MINI_ROUTER_HEALTH_INTERVAL_SECS", "0"),
+    ])
+    .await;
+
+    // The pool works, from the first member.
+    let res = openai_chat(addr, "fast").bearer("sk-client").send().await;
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.upstream(), Some("openai"));
+    assert_eq!(res.model(), Some("gpt-4o-mini"));
+
+    // The alias works.
+    let aliased = openai_chat(addr, "gpt-3.5-turbo")
+        .bearer("sk-client")
+        .send()
+        .await;
+    assert_eq!(aliased.status, 200);
+    assert_eq!(aliased.upstream(), Some("openai"));
+
+    // Auth from the environment is enforced.
+    assert_eq!(openai_chat(addr, "fast").send().await.status, 401);
+
+    // Spillover reaches the other dialect, translating on the way.
+    a.set_status(500);
+    let spilled = anthropic_chat(addr, "fast")
+        .header("x-api-key", "sk-client")
+        .send()
+        .await;
+    assert_eq!(spilled.status, 200, "body: {}", spilled.body);
+    assert_eq!(spilled.upstream(), Some("anthropic"));
+    assert_eq!(spilled.json()["content"][0]["text"], "hello from anthropic");
+    // Each provider still got its own credential.
+    assert_eq!(
+        b.last_header("x-api-key").as_deref(),
+        Some("sk-anthropic-secret")
+    );
+}
+
+#[tokio::test]
+async fn admin_and_metrics_can_be_switched_off_from_the_environment() {
+    let p = start_mock("oai", Openai, &["m"]).await;
+    let addr = start_router_from_env(&[
+        ("MINI_ROUTER_PROVIDER_OAI_URL", &p.base_url()),
+        ("MINI_ROUTER_ADMIN", "false"),
+        ("MINI_ROUTER_METRICS", "false"),
+        ("MINI_ROUTER_HEALTH_INTERVAL_SECS", "0"),
+    ])
+    .await;
+
+    // Gone, not merely unauthenticated.
+    assert_eq!(get(&format!("http://{addr}/metrics")).await.status, 404);
+    assert_eq!(
+        get(&format!("http://{addr}/admin/upstreams")).await.status,
+        404
+    );
+
+    // What a container runtime probes stays, and so does the actual job.
+    assert_eq!(get(&format!("http://{addr}/healthz")).await.status, 200);
+    assert_eq!(get(&format!("http://{addr}/readyz")).await.status, 200);
+    assert_eq!(openai_chat(addr, "m").send().await.status, 200);
+}

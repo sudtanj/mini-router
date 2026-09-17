@@ -1,8 +1,9 @@
 # /etc/systemd/system/mini-router.service
 #
 #   sudo install -m755 mini-router /usr/local/bin/
-#   sudo install -m644 -D mini-router.toml /etc/mini-router/mini-router.toml
 #   sudo install -m644 deploy/mini-router.service /etc/systemd/system/
+#   sudo install -m600 -D /dev/null /etc/mini-router/env
+#   sudo $EDITOR /etc/mini-router/env
 #   sudo systemctl enable --now mini-router
 
 [Unit]
@@ -13,14 +14,22 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-ExecStart=/usr/local/bin/mini-router --config /etc/mini-router/mini-router.toml
+ExecStart=/usr/local/bin/mini-router
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Provider API keys belong here, not in the config file. One per line:
+# The whole configuration lives here; there is no config file to manage.
+# One KEY=value per line, mode 600 since it holds your provider keys:
+#
 #   OPENAI_API_KEY=sk-...
 #   ANTHROPIC_API_KEY=sk-ant-...
-# Create it mode 600 and reference the names with `api_key_env`.
-EnvironmentFile=-/etc/mini-router/env
+#   MINI_ROUTER_POOL_FAST=openai:gpt-4o-mini,anthropic:claude-haiku-4-5
+#   MINI_ROUTER_REQUIRE_AUTH=true
+#   MINI_ROUTER_API_KEYS=sk-your-own-key
+#
+# `mini-router --help` lists every variable. To use a TOML file as well, add
+# MINI_ROUTER_CONFIG=/etc/mini-router/mini-router.toml here; the environment
+# still overrides it.
+EnvironmentFile=/etc/mini-router/env
 
 Restart=on-failure
 RestartSec=5s

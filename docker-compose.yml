@@ -1,0 +1,85 @@
+# mini-router
+#
+#   cp .env.example .env     # put your provider keys in it
+#   docker compose up -d
+#
+# Then point any OpenAI client at http://localhost:8080/v1 and any Anthropic
+# client at http://localhost:8080, and ask for the model "fast".
+
+services:
+  mini-router:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    # Or use a published image instead of building:
+    # image: ghcr.io/sudtanj/mini-router:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+
+    environment:
+      # --- Providers ---------------------------------------------------------
+      # A key on its own is enough: mini-router knows these providers' URLs and
+      # which dialect each one speaks. Leave out the ones you do not have.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+
+      # Anything else, or to point a well-known provider somewhere else:
+      # MINI_ROUTER_PROVIDER_LOCAL_URL: http://ollama:11434/v1
+      # MINI_ROUTER_PROVIDER_LOCAL_MAX_CONCURRENCY: "1"
+
+      # --- Pools -------------------------------------------------------------
+      # One client-facing name over several provider models, in priority order.
+      # The first one serves; anything that fails spills to the next, across
+      # providers and across dialects.
+      MINI_ROUTER_POOL_FAST: openai:gpt-4o-mini,anthropic:claude-haiku-4-5
+      MINI_ROUTER_POOL_SMART: anthropic:claude-sonnet-4-5,openai:gpt-4o
+
+      # Apps with a hard-coded model name can still reach a pool.
+      MINI_ROUTER_ALIASES: gpt-3.5-turbo=fast,gpt-4o-mini=fast
+
+      # --- Access ------------------------------------------------------------
+      # Turn this on if anything but you can reach the port: these keys are what
+      # stand between a stray device and your provider bills.
+      MINI_ROUTER_REQUIRE_AUTH: "true"
+      MINI_ROUTER_API_KEYS: ${MINI_ROUTER_API_KEYS:?set MINI_ROUTER_API_KEYS in .env}
+
+      # --- Trimming ----------------------------------------------------------
+      # Both are JSON/text endpoints, not a dashboard -- mini-router has no web
+      # UI at all -- but you can switch them off. /healthz and /readyz stay.
+      # MINI_ROUTER_ADMIN: "false"
+      # MINI_ROUTER_METRICS: "false"
+
+      MINI_ROUTER_LOG: info
+
+    # It idles at about 5 MB and stays there under load, so this is generous.
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+
+  # A local model server, if you want one behind the same endpoint. It is just
+  # another OpenAI-compatible provider as far as mini-router is concerned.
+  # ollama:
+  #   image: ollama/ollama
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ollama:/root/.ollama
+
+# volumes:
+#   ollama:

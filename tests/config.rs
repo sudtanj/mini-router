@@ -33,6 +33,9 @@ fn minimal_config_gets_sensible_defaults() {
     assert_eq!(cfg.translate.default_max_tokens, 4096);
     assert_eq!(cfg.translate.anthropic_version, "2023-06-01");
     assert!(!cfg.server.auth.require_auth);
+    // Observability is on unless switched off; there is no UI behind either.
+    assert!(cfg.server.admin);
+    assert!(cfg.server.metrics);
 }
 
 #[test]
@@ -181,8 +184,12 @@ fn error_for(toml: &str) -> String {
 }
 
 #[test]
-fn rejects_a_config_with_no_upstreams() {
-    assert!(error_for("[server]\nlisten = \"0.0.0.0:8080\"").contains("no [[upstream]]"));
+fn rejects_a_config_with_no_providers() {
+    let err = error_for("[server]\nlisten = \"0.0.0.0:8080\"");
+    assert!(err.contains("no providers configured"), "{err}");
+    // The message should say how to fix it, in both idioms.
+    assert!(err.contains("OPENAI_API_KEY"), "{err}");
+    assert!(err.contains("[[upstream]]"), "{err}");
 }
 
 #[test]

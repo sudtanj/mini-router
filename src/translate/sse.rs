@@ -40,10 +40,7 @@ impl SseParser {
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buf.extend_from_slice(chunk);
         let mut events = Vec::new();
-        loop {
-            let Some((frame_len, sep_len)) = find_frame_end(&self.buf) else {
-                break;
-            };
+        while let Some((frame_len, sep_len)) = find_frame_end(&self.buf) {
             let frame = self.buf[..frame_len].to_vec();
             self.buf.drain(..frame_len + sep_len);
             if let Some(ev) = parse_frame(&frame) {

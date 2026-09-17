@@ -8,10 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Planned
 
-- Token accounting from non-streamed responses and stream `usage` frames.
+- Cost-aware routing: per-member price, prefer the cheapest healthy member.
+- Token accounting from streamed `usage` frames.
+- Response caching for identical requests.
 - Config hot-reload on `SIGHUP`.
-- Per-request model fallback chains.
-- Optional HTTP/2 to upstreams.
+- Per-request fallback chains (`model: ["a", "b"]`).
+- Optional HTTP/2 to providers.
 
 ## [0.1.0] - 2026-09-17
 
@@ -19,29 +21,59 @@ First release.
 
 ### Added
 
-- OpenAI-compatible proxy for `/v1/*`, with explicit handling of `/v1/models`
-  and a catch-all that forwards any other endpoint unchanged.
-- Model aggregation across upstreams, with automatic discovery from
-  `GET {url}/models` refreshed on every health probe.
-- Five balancing strategies: `p2c-latency` (default), `least-conn`,
-  `round-robin`, `weighted` and `first-available`.
-- Per-upstream admission control (`max_concurrency`) with a bounded queue and a
-  `429` when the queue times out.
-- Failover across upstreams on connection errors, timeouts and configurable
-  status codes, with a circuit breaker and cooldown per upstream.
-- Active health probing with configurable failure and success thresholds.
-- Streaming passthrough: SSE bodies are forwarded frame by frame, and an
-  upstream's slot is held until the stream ends or the client disconnects.
-- Model aliases, rewritten in the request body before forwarding.
-- Client API-key authentication with constant-time comparison; separate
-  per-upstream credentials that are never taken from the client.
-- `fallback_only` upstreams, held back until no ordinary upstream serves the
-  requested model.
-- Prometheus metrics at `/metrics`, `/healthz`, `/readyz` and a JSON view of the
-  upstream pool at `/admin/upstreams`.
-- systemd unit and Dockerfile in `deploy/`.
-- Optional `tls` feature (on by default) so a LAN-only deployment can drop about
-  a megabyte of binary.
+**Two front doors, every provider behind them**
+
+- OpenAI-compatible ingress at `POST /v1/chat/completions` and
+  Anthropic-compatible ingress at `POST /v1/messages`, on the same port.
+- Full translation between the two dialects in both directions, covering system
+  prompts, multi-turn conversations, tool definitions, tool calls and results,
+  images (base64 and URL), sampling parameters, stop sequences, token usage and
+  stop/finish reasons.
+- Incremental translation of server-sent event streams, including reassembly of
+  tool-call argument fragments, and correct termination even when a provider
+  hangs up mid-generation.
+- Per-provider `protocol`, defaulting to `openai` because most providers are
+  OpenAI-compatible.
+- `/v1/models` served in whichever dialect the client asked in, disambiguated by
+  the `anthropic-version` header, with explicit `/openai/...` and
+  `/anthropic/...` prefixes available.
+- Errors reshaped into the client's dialect, so both SDKs can parse a failure.
+
+**Pools and spillover**
+
+- `[pool.name]`: one client-facing model name over several provider models,
+  tried in declaration order, spanning providers and dialects.
+- `spillover = "any-error"` by default: any non-2xx and every transport failure
+  moves the request to the next member, not just rate limits and 5xx.
+- The last provider's own error — status and message — is returned when every
+  candidate is exhausted, translated into the client's dialect.
+- `Retry-After` is honoured, parking a rate-limited provider for exactly as long
+  as it asked, up to `health.max_cooldown_secs`.
+- Five ordering strategies: `priority` (default), `round-robin`, `least-conn`,
+  `weighted` and `p2c-latency`, overridable per pool.
+- Model aliases, which may point at a pool.
+- `fallback_only` providers, held back until nothing else serves the model.
+
+**Operations**
+
+- Client API keys accepted as `Authorization: Bearer` or `x-api-key`, compared
+  in constant time; per-provider credentials that are never taken from the
+  client and are sent in the header that provider expects.
+- Active health probing that doubles as model discovery, per-provider circuit
+  breaker and cooldown.
+- Per-provider `max_concurrency` with a bounded queue and a `429` on timeout.
+- Prometheus metrics at `/metrics`, plus `/healthz`, `/readyz` and a JSON view
+  of providers and pools at `/admin/upstreams`.
+- Extra per-provider request headers, for providers that require them.
+- Hardened systemd unit and a Dockerfile in `deploy/`.
+- Optional `tls` feature, on by default; turning it off drops about a megabyte
+  for an all-local-provider deployment.
+
+### Performance
+
+Measured on x86_64 against a mock provider streaming SSE through the
+translator: a 2.4 MB stripped binary (1.4 MB without TLS), 4.8 MB resident at
+idle, and 4.8 MB resident during 48 concurrent translated streams.
 
 [Unreleased]: https://github.com/sudtanj/mini-router/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/sudtanj/mini-router/releases/tag/v0.1.0

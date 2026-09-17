@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{header, HeaderValue, Request};
+use axum::http::{HeaderMap, Request};
 use http_body_util::{BodyExt, Limited};
 use tokio::task::JoinHandle;
 use tokio::time::{interval_at, Instant, MissedTickBehavior};
 
+use crate::protocol::apply_auth;
 use crate::state::SharedState;
 use crate::upstream::Upstream;
 
@@ -59,11 +60,23 @@ pub async fn probe(state: &SharedState, up: &Arc<Upstream>) {
     let cfg = &state.cfg.health;
     let url = up.cfg.join(&cfg.path);
     let mut builder = Request::builder().method("GET").uri(&url);
-    if let (Some(hs), Some(key)) = (builder.headers_mut(), up.api_key.as_ref()) {
-        if let Ok(mut v) = HeaderValue::from_str(&format!("Bearer {key}")) {
-            v.set_sensitive(true);
-            hs.insert(header::AUTHORIZATION, v);
+    if let Some(hs) = builder.headers_mut() {
+        // Probe with the credentials this provider expects, in its dialect.
+        *hs = HeaderMap::new();
+        for (name, value) in &up.cfg.headers {
+            if let (Ok(n), Ok(v)) = (
+                axum::http::HeaderName::try_from(name.as_str()),
+                axum::http::HeaderValue::from_str(value),
+            ) {
+                hs.insert(n, v);
+            }
         }
+        apply_auth(
+            hs,
+            up.cfg.protocol,
+            up.api_key.as_deref(),
+            &state.cfg.translate.anthropic_version,
+        );
     }
     let Ok(req) = builder.body(Body::empty()) else {
         tracing::error!(upstream = %up.name, url = %url, "invalid health probe url");
@@ -114,10 +127,12 @@ async fn fail(state: &SharedState, up: &Arc<Upstream>, message: String) {
     up.record_failure(cfg.failure_threshold, cfg.cooldown());
 }
 
-/// Pull model ids out of an OpenAI `GET /models` response.
+/// Pull model ids out of a `GET /models` response.
 ///
-/// Also accepts Ollama's `{"models": [{"name": ...}]}`, because a fair number
-/// of small deployments point mini-router straight at Ollama's native port.
+/// Both dialects use `data[].id`, so one parser covers OpenAI, Anthropic and
+/// the many OpenAI-compatible providers. Ollama's native
+/// `{"models": [{"name": ...}]}` is accepted too, for a local model server
+/// sitting alongside the remote ones.
 pub fn parse_model_ids(body: &[u8]) -> Option<Vec<String>> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let items = v
@@ -150,11 +165,26 @@ mod tests {
     #[test]
     fn parses_openai_model_list() {
         let body = br#"{"object":"list","data":[
-            {"id":"qwen2.5:0.5b","object":"model"},
-            {"id":"smollm2:135m","object":"model"}]}"#;
+            {"id":"gpt-4o-mini","object":"model"},
+            {"id":"gpt-4o","object":"model"}]}"#;
         assert_eq!(
             parse_model_ids(body).unwrap(),
-            vec!["qwen2.5:0.5b".to_string(), "smollm2:135m".to_string()]
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_model_list() {
+        let body = br#"{"data":[
+            {"type":"model","id":"claude-haiku-4-5","display_name":"Claude Haiku 4.5"},
+            {"type":"model","id":"claude-sonnet-4-5","display_name":"Claude Sonnet 4.5"}],
+            "has_more":false}"#;
+        assert_eq!(
+            parse_model_ids(body).unwrap(),
+            vec![
+                "claude-haiku-4-5".to_string(),
+                "claude-sonnet-4-5".to_string()
+            ]
         );
     }
 

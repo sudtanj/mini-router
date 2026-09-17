@@ -1,248 +1,798 @@
-//! End-to-end tests: real HTTP, real sockets, mock upstreams.
+//! End-to-end tests: real HTTP, real sockets, mock providers of both dialects.
 
 mod support;
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
 use http_body_util::BodyExt;
+use mini_router::protocol::Protocol::{Anthropic, Openai};
+use serde_json::{json, Value};
 use support::*;
 
-#[tokio::test]
-async fn forwards_a_chat_completion_and_names_the_upstream() {
-    let mock = start_mock("board-a", &["qwen2.5:0.5b"]).await;
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        models = ["qwen2.5:0.5b"]
-        "#,
-        mock.base_url()
-    ))
-    .await;
+/// Config preamble: no background probing, so tests are deterministic.
+const QUIET: &str = "[health]\ninterval_secs = 0\n";
 
-    let res = chat(addr, "qwen2.5:0.5b").await;
+// ---------------------------------------------------------------------------
+// The four-way matrix: either front door reaching either kind of provider
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn openai_client_to_openai_provider_is_passthrough() {
+    let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let res = openai_chat(addr, "gpt-4o-mini").send().await;
     assert_eq!(res.status, 200, "body: {}", res.body);
-    assert_eq!(res.upstream(), Some("board-a"));
-    assert_eq!(res.json()["served_by"], "board-a");
-    assert_eq!(mock.hits(), 1);
+    assert_eq!(res.upstream(), Some("oai"));
+    assert_eq!(res.model(), Some("gpt-4o-mini"));
+    assert_eq!(
+        res.translated(),
+        None,
+        "same dialect must not be translated at all"
+    );
+    assert_eq!(
+        res.json()["choices"][0]["message"]["content"],
+        "hello from oai"
+    );
 }
 
 #[tokio::test]
-async fn injects_the_upstream_api_key_and_hides_the_client_one() {
-    let mock = start_mock("board-a", &[]).await;
+async fn openai_client_reaches_an_anthropic_provider() {
+    let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let res = Req::post(
+        format!("http://{addr}/v1/chat/completions"),
+        json!({
+            "model": "claude-haiku-4-5",
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hi"}
+            ],
+            "temperature": 0.5
+        }),
+    )
+    .send()
+    .await;
+
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.translated(), Some("anthropic->openai"));
+
+    // The provider received an Anthropic-shaped request.
+    let sent = p.last_body();
+    assert_eq!(
+        sent["system"], "Be brief.",
+        "system must move beside turns: {sent}"
+    );
+    assert!(
+        sent["max_tokens"].is_number(),
+        "Anthropic requires max_tokens: {sent}"
+    );
+    assert_eq!(sent["temperature"], 0.5);
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "hi");
+    assert!(sent.get("messages").unwrap()[0].get("role").unwrap() == "user");
+
+    // The client got an OpenAI-shaped response back.
+    let got = res.json();
+    assert_eq!(got["object"], "chat.completion");
+    assert_eq!(got["choices"][0]["message"]["content"], "hello from ant");
+    assert_eq!(got["choices"][0]["finish_reason"], "stop");
+    assert_eq!(got["usage"]["prompt_tokens"], 5);
+    assert_eq!(got["usage"]["total_tokens"], 8);
+}
+
+#[tokio::test]
+async fn anthropic_client_to_anthropic_provider_is_passthrough() {
+    let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let res = anthropic_chat(addr, "claude-haiku-4-5").send().await;
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.upstream(), Some("ant"));
+    assert_eq!(res.translated(), None);
+    assert_eq!(res.json()["content"][0]["text"], "hello from ant");
+    assert_eq!(res.json()["type"], "message");
+}
+
+#[tokio::test]
+async fn anthropic_client_reaches_an_openai_provider() {
+    let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let res = Req::post(
+        format!("http://{addr}/v1/messages"),
+        json!({
+            "model": "gpt-4o-mini",
+            "max_tokens": 128,
+            "system": "Be brief.",
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .anthropic()
+    .send()
+    .await;
+
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.translated(), Some("openai->anthropic"));
+
+    // The provider received an OpenAI-shaped request.
+    let sent = p.last_body();
+    assert_eq!(sent["messages"][0]["role"], "system");
+    assert_eq!(sent["messages"][0]["content"], "Be brief.");
+    assert_eq!(sent["messages"][1]["content"], "hi");
+    assert_eq!(sent["max_tokens"], 128);
+
+    // The client got an Anthropic-shaped response back.
+    let got = res.json();
+    assert_eq!(got["type"], "message");
+    assert_eq!(got["role"], "assistant");
+    assert_eq!(got["content"][0]["text"], "hello from oai");
+    assert_eq!(got["stop_reason"], "end_turn");
+    assert_eq!(got["usage"]["input_tokens"], 5);
+    assert_eq!(got["usage"]["output_tokens"], 3);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming, translated and not
+// ---------------------------------------------------------------------------
+
+struct Stream {
+    body: String,
+    first_chunk: Duration,
+    total: Duration,
+    frames: usize,
+}
+
+/// Issue a streaming request and record how the bytes actually arrived.
+async fn stream(req: axum::http::Request<axum::body::Body>) -> Stream {
+    let started = Instant::now();
+    let resp = client().request(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/event-stream",
+        "a streamed answer must keep its content type"
+    );
+    let mut body = resp.into_body();
+    let mut first_chunk = None;
+    let mut out = String::new();
+    let mut frames = 0;
+    while let Some(frame) = body.frame().await {
+        if let Some(data) = frame.unwrap().data_ref() {
+            first_chunk.get_or_insert_with(|| started.elapsed());
+            frames += 1;
+            out.push_str(&String::from_utf8_lossy(data));
+        }
+    }
+    Stream {
+        body: out,
+        first_chunk: first_chunk.expect("at least one chunk"),
+        total: started.elapsed(),
+        frames,
+    }
+}
+
+fn streaming_request(
+    url: String,
+    body: Value,
+    anthropic: bool,
+) -> axum::http::Request<axum::body::Body> {
+    let mut b = axum::http::Request::builder()
+        .method("POST")
+        .uri(url)
+        .header("content-type", "application/json");
+    if anthropic {
+        b = b.header("anthropic-version", "2023-06-01");
+    }
+    b.body(axum::body::Body::from(body.to_string())).unwrap()
+}
+
+#[tokio::test]
+async fn an_anthropic_stream_is_translated_into_openai_chunks_incrementally() {
+    let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let s = stream(streaming_request(
+        format!("http://{addr}/v1/chat/completions"),
+        json!({"model": "claude-haiku-4-5", "messages": [{"role":"user","content":"hi"}], "stream": true}),
+        false,
+    ))
+    .await;
+
+    // OpenAI-shaped frames, terminated the way an OpenAI SDK expects.
+    assert!(s.body.contains("chat.completion.chunk"), "{}", s.body);
+    assert!(s.body.trim_end().ends_with("data: [DONE]"), "{}", s.body);
+    assert!(
+        !s.body.contains("event: "),
+        "no Anthropic frames should leak: {}",
+        s.body
+    );
+
+    let text: String = s
+        .body
+        .split("\n\n")
+        .filter_map(|f| f.trim().strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|c| {
+            c["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(text, "hello from ant");
+
+    // Translation must not turn the stream into a buffer.
+    assert!(s.frames > 1, "expected several frames, got {}", s.frames);
+    assert!(
+        s.first_chunk < s.total / 2,
+        "first chunk at {:?} but stream ended at {:?}: looks buffered",
+        s.first_chunk,
+        s.total
+    );
+}
+
+#[tokio::test]
+async fn an_openai_stream_is_translated_into_anthropic_events_incrementally() {
+    let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let s = stream(streaming_request(
+        format!("http://{addr}/v1/messages"),
+        json!({"model": "gpt-4o-mini", "max_tokens": 64,
+               "messages": [{"role":"user","content":"hi"}], "stream": true}),
+        true,
+    ))
+    .await;
+
+    for expected in [
+        "event: message_start",
+        "event: content_block_start",
+        "event: content_block_delta",
+        "event: content_block_stop",
+        "event: message_delta",
+        "event: message_stop",
+    ] {
+        assert!(
+            s.body.contains(expected),
+            "missing {expected} in:\n{}",
+            s.body
+        );
+    }
+    assert!(
+        !s.body.contains("[DONE]"),
+        "OpenAI terminator must not leak: {}",
+        s.body
+    );
+
+    let text: String = s
+        .body
+        .split("\n\n")
+        .filter(|f| f.contains("content_block_delta"))
+        .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|e| e["delta"]["text"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(text, "hello from oai");
+
+    assert!(s.frames > 1, "expected several frames, got {}", s.frames);
+    assert!(
+        s.first_chunk < s.total / 2,
+        "first chunk at {:?} but stream ended at {:?}: looks buffered",
+        s.first_chunk,
+        s.total
+    );
+}
+
+#[tokio::test]
+async fn a_same_dialect_stream_passes_straight_through() {
+    let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let s = stream(streaming_request(
+        format!("http://{addr}/v1/chat/completions"),
+        json!({"model": "gpt-4o-mini", "messages": [{"role":"user","content":"hi"}], "stream": true}),
+        false,
+    ))
+    .await;
+
+    assert!(s.body.trim_end().ends_with("data: [DONE]"));
+    assert!(s.frames > 1);
+    assert!(s.first_chunk < s.total / 2);
+}
+
+// ---------------------------------------------------------------------------
+// Tool calls across dialects
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tool_calls_translate_from_anthropic_to_openai() {
+    let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let res = Req::post(
+        format!("http://{addr}/v1/chat/completions"),
+        json!({
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]
+        }),
+    )
+    .send()
+    .await;
+
+    // The provider saw an Anthropic tool definition.
+    let sent = p.last_body();
+    assert_eq!(sent["tools"][0]["name"], "get_weather");
+    assert_eq!(
+        sent["tools"][0]["input_schema"]["properties"]["city"]["type"],
+        "string"
+    );
+
+    // The client saw OpenAI tool_calls.
+    let got = res.json();
+    assert_eq!(got["choices"][0]["finish_reason"], "tool_calls");
+    let call = &got["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "get_weather");
+    let args: Value =
+        serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["city"], "Paris");
+}
+
+#[tokio::test]
+async fn streamed_tool_calls_translate_from_openai_to_anthropic() {
+    let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let s = stream(streaming_request(
+        format!("http://{addr}/v1/messages"),
+        json!({"model": "gpt-4o-mini", "max_tokens": 64, "stream": true,
+               "messages": [{"role":"user","content":"weather?"}],
+               "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]}),
+        true,
+    ))
+    .await;
+
+    assert!(s.body.contains("\"type\":\"tool_use\""), "{}", s.body);
+    assert!(s.body.contains("get_weather"), "{}", s.body);
+
+    let args: String = s
+        .body
+        .split("\n\n")
+        .filter(|f| f.contains("input_json_delta"))
+        .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|e| e["delta"]["partial_json"].as_str().map(str::to_owned))
+        .collect();
+    let parsed: Value = serde_json::from_str(&args).expect("fragments should reassemble");
+    assert_eq!(parsed["city"], "Paris");
+    assert!(
+        s.body.contains("\"stop_reason\":\"tool_use\""),
+        "{}",
+        s.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pools
+// ---------------------------------------------------------------------------
+
+/// A pool spanning both kinds of provider, in priority order.
+async fn pool_setup() -> (Mock, Mock, SocketAddr) {
+    let a = start_mock("openai", Openai, &["gpt-4o-mini"]).await;
+    let b = start_mock("anthropic", Anthropic, &["claude-haiku-4-5"]).await;
     let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
+        r#"{QUIET}{}{}
+        [pool.fast]
+        members = [
+          {{ upstream = "openai", model = "gpt-4o-mini" }},
+          {{ upstream = "anthropic", model = "claude-haiku-4-5" }},
+        ]
+        "#,
+        a.upstream_toml(),
+        b.upstream_toml()
+    ))
+    .await;
+    (a, b, addr)
+}
+
+#[tokio::test]
+async fn a_pool_serves_one_name_from_the_first_member() {
+    let (a, b, addr) = pool_setup().await;
+
+    for _ in 0..3 {
+        let res = openai_chat(addr, "fast").send().await;
+        assert_eq!(res.status, 200, "body: {}", res.body);
+        assert_eq!(
+            res.upstream(),
+            Some("openai"),
+            "priority means first member"
+        );
+        assert_eq!(
+            res.model(),
+            Some("gpt-4o-mini"),
+            "the pool picks the provider's model id"
+        );
+    }
+    assert_eq!(a.hits(), 3);
+    assert_eq!(
+        b.hits(),
+        0,
+        "the second member is the spillover path, not a peer"
+    );
+}
+
+#[tokio::test]
+async fn a_pool_spills_to_a_provider_of_the_other_dialect() {
+    let (a, b, addr) = pool_setup().await;
+    a.set_status(500);
+
+    let res = openai_chat(addr, "fast").send().await;
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.upstream(), Some("anthropic"));
+    assert_eq!(res.model(), Some("claude-haiku-4-5"));
+    // Reaching the Anthropic member from an OpenAI client means translating.
+    assert_eq!(res.translated(), Some("anthropic->openai"));
+    assert_eq!(
+        res.json()["choices"][0]["message"]["content"],
+        "hello from anthropic"
+    );
+    assert_eq!(a.hits(), 1, "the failing member was tried first");
+    assert_eq!(b.hits(), 1);
+}
+
+#[tokio::test]
+async fn an_anthropic_client_can_use_the_same_pool() {
+    let (a, _b, addr) = pool_setup().await;
+
+    let res = anthropic_chat(addr, "fast").send().await;
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.upstream(), Some("openai"));
+    assert_eq!(res.translated(), Some("openai->anthropic"));
+    assert_eq!(res.json()["content"][0]["text"], "hello from openai");
+    // The OpenAI provider was asked in its own dialect.
+    assert!(a.last_body()["messages"].is_array());
+    assert_eq!(a.last_body()["model"], "gpt-4o-mini");
+}
+
+#[tokio::test]
+async fn a_pool_can_override_the_balancing_strategy() {
+    let a = start_mock("a", Openai, &["m"]).await;
+    let b = start_mock("b", Openai, &["m"]).await;
+    let addr = start_router(&format!(
+        r#"{QUIET}{}{}
+        [pool.spread]
+        strategy = "round-robin"
+        members = [
+          {{ upstream = "a", model = "m" }},
+          {{ upstream = "b", model = "m" }},
+        ]
+        "#,
+        a.upstream_toml(),
+        b.upstream_toml()
+    ))
+    .await;
+
+    for _ in 0..10 {
+        assert_eq!(openai_chat(addr, "spread").send().await.status, 200);
+    }
+    assert_eq!(a.hits(), 5);
+    assert_eq!(b.hits(), 5);
+}
+
+// ---------------------------------------------------------------------------
+// Spillover on *any* error
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_kind_of_failure_spills_over() {
+    // Not just rate limits and 5xx: a bad key, a missing model and a refused
+    // request all mean "this provider is not going to serve it, try the next".
+    for status in [400u16, 401, 403, 404, 409, 422, 429, 500, 502, 503, 529] {
+        let a = start_mock("first", Openai, &["m"]).await;
+        let b = start_mock("second", Openai, &["m"]).await;
+        a.set_status(status);
+        let addr = start_router(&format!(
+            r#"{QUIET}{}{}
+            [pool.p]
+            members = [
+              {{ upstream = "first", model = "m" }},
+              {{ upstream = "second", model = "m" }},
+            ]
+            "#,
+            a.upstream_toml(),
+            b.upstream_toml()
+        ))
+        .await;
+
+        let res = openai_chat(addr, "p").send().await;
+        assert_eq!(
+            res.status, 200,
+            "status {status} should have spilled over: {}",
+            res.body
+        );
+        assert_eq!(res.upstream(), Some("second"), "status {status}");
+        assert_eq!(a.hits(), 1, "status {status}");
+        assert_eq!(b.hits(), 1, "status {status}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_connection_spills_over() {
+    let good = start_mock("good", Openai, &["m"]).await;
+    // Port 1 on loopback refuses immediately.
+    let addr = start_router(&format!(
+        r#"{QUIET}
+        [[upstream]]
+        name = "dead"
+        url = "http://127.0.0.1:1/v1"
+        {}
+        [pool.p]
+        members = [
+          {{ upstream = "dead", model = "m" }},
+          {{ upstream = "good", model = "m" }},
+        ]
+        "#,
+        good.upstream_toml()
+    ))
+    .await;
+
+    let res = openai_chat(addr, "p").send().await;
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.upstream(), Some("good"));
+}
+
+#[tokio::test]
+async fn status_list_spillover_can_be_narrowed() {
+    let a = start_mock("first", Openai, &["m"]).await;
+    let b = start_mock("second", Openai, &["m"]).await;
+    a.set_status(400);
+    let addr = start_router(&format!(
+        r#"{QUIET}
+        [balance]
+        spillover = "status-list"
+        retry_on_status = [503]
+        {}{}
+        [pool.p]
+        members = [
+          {{ upstream = "first", model = "m" }},
+          {{ upstream = "second", model = "m" }},
+        ]
+        "#,
+        a.upstream_toml(),
+        b.upstream_toml()
+    ))
+    .await;
+
+    // 400 is not in the list, so it is the client's answer.
+    let res = openai_chat(addr, "p").send().await;
+    assert_eq!(res.status, 400);
+    assert_eq!(
+        b.hits(),
+        0,
+        "narrowed spillover must not try the next member"
+    );
+}
+
+#[tokio::test]
+async fn the_last_providers_own_error_reaches_the_client() {
+    let a = start_mock("first", Openai, &["m"]).await;
+    let b = start_mock("second", Anthropic, &["m"]).await;
+    a.set_status(500);
+    b.set_status(429);
+    let addr = start_router(&format!(
+        r#"{QUIET}{}{}
+        [pool.p]
+        members = [
+          {{ upstream = "first", model = "m" }},
+          {{ upstream = "second", model = "m" }},
+        ]
+        "#,
+        a.upstream_toml(),
+        b.upstream_toml()
+    ))
+    .await;
+
+    let res = openai_chat(addr, "p").send().await;
+    // The status and the message come from the provider, not from us.
+    assert_eq!(res.status, 429);
+    let body = res.json();
+    assert_eq!(
+        body["error"]["message"], "second says no",
+        "the provider's own explanation is more useful than ours: {}",
+        res.body
+    );
+    // ...but shaped for the dialect the client is speaking.
+    assert!(
+        body.get("type").is_none(),
+        "must not be Anthropic-shaped: {}",
+        res.body
+    );
+}
+
+#[tokio::test]
+async fn an_anthropic_client_gets_errors_in_its_own_dialect() {
+    let p = start_mock("oai", Openai, &["m"]).await;
+    p.set_status(500);
+    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+
+    let res = anthropic_chat(addr, "m").send().await;
+    assert_eq!(res.status, 500);
+    let body = res.json();
+    assert_eq!(body["type"], "error", "body: {}", res.body);
+    assert_eq!(body["error"]["message"], "oai says no");
+
+    // And a router-generated error, too.
+    let missing = anthropic_chat(addr, "no-such-model").send().await;
+    assert_eq!(missing.status, 503);
+    assert_eq!(missing.json()["type"], "error");
+    assert_eq!(missing.json()["error"]["type"], "overloaded_error");
+}
+
+#[tokio::test]
+async fn a_rate_limited_provider_is_parked_for_the_time_it_asked_for() {
+    let a = start_mock("limited", Openai, &["m"]).await;
+    let b = start_mock("spare", Openai, &["m"]).await;
+    a.set_status(429);
+    a.set_retry_after(60);
+    let addr = start_router(&format!(
+        r#"{QUIET}{}{}
+        [pool.p]
+        members = [
+          {{ upstream = "limited", model = "m" }},
+          {{ upstream = "spare", model = "m" }},
+        ]
+        "#,
+        a.upstream_toml(),
+        b.upstream_toml()
+    ))
+    .await;
+
+    assert_eq!(openai_chat(addr, "p").send().await.status, 200);
+    assert_eq!(a.hits(), 1);
+
+    // It said 60 seconds, so it should not be asked again in this test.
+    for _ in 0..3 {
+        let res = openai_chat(addr, "p").send().await;
+        assert_eq!(res.status, 200);
+        assert_eq!(res.upstream(), Some("spare"));
+    }
+    assert_eq!(a.hits(), 1, "a parked provider must not be retried");
+
+    let admin = get(&format!("http://{addr}/admin/upstreams")).await;
+    let limited = admin.json()["upstreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["name"] == "limited")
+        .unwrap()
+        .clone();
+    assert_eq!(limited["health"], "down");
+}
+
+// ---------------------------------------------------------------------------
+// Credentials
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn each_provider_gets_its_own_credential_in_its_own_header() {
+    let a = start_mock("openai", Openai, &["m"]).await;
+    let b = start_mock("anthropic", Anthropic, &["m"]).await;
+    let addr = start_router(&format!(
+        r#"{QUIET}
         [server.auth]
         require_auth = true
         api_keys = ["sk-client"]
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        api_key = "sk-upstream"
+        {}{}
+        [pool.p]
+        members = [
+          {{ upstream = "openai", model = "m" }},
+          {{ upstream = "anthropic", model = "m" }},
+        ]
         "#,
-        mock.base_url()
+        a.upstream_toml(),
+        b.upstream_toml()
     ))
     .await;
 
-    let res = request(
-        "POST",
-        &format!("http://{addr}/v1/chat/completions"),
-        Some(serde_json::json!({"model": "m", "messages": []})),
-        Some("sk-client"),
-    )
-    .await;
+    assert_eq!(
+        openai_chat(addr, "p")
+            .bearer("sk-client")
+            .send()
+            .await
+            .status,
+        200
+    );
+    // OpenAI gets a bearer token, and never the client's.
+    assert_eq!(
+        a.last_header("authorization").as_deref(),
+        Some("Bearer sk-openai-secret")
+    );
+    assert_eq!(a.last_header("x-api-key"), None);
 
-    assert_eq!(res.status, 200);
-    // The upstream must see its own credential, never the client's.
-    assert_eq!(mock.last_auth().as_deref(), Some("Bearer sk-upstream"));
+    a.set_status(500);
+    assert_eq!(
+        openai_chat(addr, "p")
+            .bearer("sk-client")
+            .send()
+            .await
+            .status,
+        200
+    );
+    // Anthropic gets x-api-key plus a version, and no bearer token.
+    assert_eq!(
+        b.last_header("x-api-key").as_deref(),
+        Some("sk-anthropic-secret")
+    );
+    assert_eq!(
+        b.last_header("anthropic-version").as_deref(),
+        Some("2023-06-01")
+    );
+    assert_eq!(b.last_header("authorization"), None);
 }
 
 #[tokio::test]
-async fn rejects_requests_without_a_valid_key() {
-    let mock = start_mock("board-a", &[]).await;
+async fn client_auth_accepts_either_sdks_header() {
+    let p = start_mock("oai", Openai, &["m"]).await;
     let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
+        r#"{QUIET}
         [server.auth]
         require_auth = true
-        api_keys = ["sk-good"]
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        "#,
-        mock.base_url()
+        api_keys = ["sk-client"]
+        {}"#,
+        p.upstream_toml()
     ))
     .await;
 
-    let missing = chat(addr, "m").await;
-    assert_eq!(missing.status, 401);
-    assert_eq!(missing.json()["error"]["type"], "authentication_error");
-
-    let wrong = request(
-        "POST",
-        &format!("http://{addr}/v1/chat/completions"),
-        Some(serde_json::json!({"model": "m", "messages": []})),
-        Some("sk-bad"),
-    )
-    .await;
-    assert_eq!(wrong.status, 401);
+    // An OpenAI SDK sends a bearer token.
     assert_eq!(
-        mock.hits(),
-        0,
-        "an unauthorized request must not reach an upstream"
+        openai_chat(addr, "m")
+            .bearer("sk-client")
+            .send()
+            .await
+            .status,
+        200
     );
-
-    let good = request(
-        "POST",
-        &format!("http://{addr}/v1/chat/completions"),
-        Some(serde_json::json!({"model": "m", "messages": []})),
-        Some("sk-good"),
-    )
-    .await;
-    assert_eq!(good.status, 200);
-    assert_eq!(mock.hits(), 1);
-}
-
-#[tokio::test]
-async fn fails_over_to_the_next_upstream() {
-    let bad = start_mock("broken", &["shared"]).await;
-    let good = start_mock("working", &["shared"]).await;
-    bad.set_status(503);
-
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [balance]
-        strategy = "first-available"
-        retries = 2
-        [[upstream]]
-        name = "broken"
-        url = "{}"
-        models = ["shared"]
-        [[upstream]]
-        name = "working"
-        url = "{}"
-        models = ["shared"]
-        "#,
-        bad.base_url(),
-        good.base_url()
-    ))
-    .await;
-
-    let res = chat(addr, "shared").await;
-    assert_eq!(res.status, 200, "body: {}", res.body);
-    assert_eq!(res.upstream(), Some("working"));
+    // An Anthropic SDK sends x-api-key.
     assert_eq!(
-        bad.hits(),
-        1,
-        "the broken upstream should have been tried first"
+        anthropic_chat(addr, "m")
+            .header("x-api-key", "sk-client")
+            .send()
+            .await
+            .status,
+        200
     );
-    assert_eq!(good.hits(), 1);
-}
 
-#[tokio::test]
-async fn reports_upstream_failure_when_every_attempt_fails() {
-    let a = start_mock("a", &["shared"]).await;
-    let b = start_mock("b", &["shared"]).await;
-    a.set_status(503);
-    b.set_status(503);
-
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [balance]
-        retries = 3
-        [[upstream]]
-        name = "a"
-        url = "{}"
-        models = ["shared"]
-        [[upstream]]
-        name = "b"
-        url = "{}"
-        models = ["shared"]
-        "#,
-        a.base_url(),
-        b.base_url()
-    ))
-    .await;
-
-    let res = chat(addr, "shared").await;
-    assert_eq!(res.status, 503);
-    let body = res.json();
-    assert_eq!(body["error"]["type"], "upstream_unavailable");
-    assert!(
-        body["error"]["message"].as_str().unwrap().contains("503"),
-        "message should name the upstream status: {body}"
+    assert_eq!(openai_chat(addr, "m").send().await.status, 401);
+    assert_eq!(
+        openai_chat(addr, "m")
+            .bearer("sk-wrong")
+            .send()
+            .await
+            .status,
+        401
+    );
+    assert_eq!(
+        p.hits(),
+        2,
+        "unauthorized requests must not reach a provider"
     );
 }
 
-#[tokio::test]
-async fn refuses_a_model_no_upstream_serves() {
-    let mock = start_mock("board-a", &["qwen2.5:0.5b"]).await;
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        models = ["qwen2.5:0.5b"]
-        "#,
-        mock.base_url()
-    ))
-    .await;
-
-    let res = chat(addr, "llama3.1:405b").await;
-    assert_eq!(res.status, 503);
-    assert!(
-        res.json()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("llama3.1:405b"),
-        "error should name the model: {}",
-        res.body
-    );
-    assert_eq!(mock.hits(), 0);
-}
+// ---------------------------------------------------------------------------
+// Catalogue
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn aggregates_models_across_upstreams_and_advertises_aliases() {
-    let a = start_mock("a", &["qwen2.5:0.5b", "shared"]).await;
-    let b = start_mock("b", &["smollm2:135m", "shared"]).await;
+async fn the_catalogue_is_served_in_both_dialects() {
+    let (_a, _b, addr) = pool_setup().await;
 
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [alias]
-        "gpt-3.5-turbo" = "qwen2.5:0.5b"
-        "nonexistent-alias" = "not-served-anywhere"
-        [[upstream]]
-        name = "a"
-        url = "{}"
-        models = ["qwen2.5:0.5b", "shared"]
-        [[upstream]]
-        name = "b"
-        url = "{}"
-        models = ["smollm2:135m", "shared"]
-        "#,
-        a.base_url(),
-        b.base_url()
-    ))
-    .await;
-
-    let res = get(&format!("http://{addr}/v1/models")).await;
-    assert_eq!(res.status, 200);
-    let body = res.json();
+    let oai = get(&format!("http://{addr}/v1/models")).await;
+    assert_eq!(oai.status, 200);
+    let body = oai.json();
     assert_eq!(body["object"], "list");
     let ids: Vec<&str> = body["data"]
         .as_array()
@@ -250,246 +800,153 @@ async fn aggregates_models_across_upstreams_and_advertises_aliases() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
+    assert_eq!(ids, vec!["claude-haiku-4-5", "fast", "gpt-4o-mini"]);
 
-    assert_eq!(
-        ids,
-        vec!["gpt-3.5-turbo", "qwen2.5:0.5b", "shared", "smollm2:135m"],
-        "catalogue should be the sorted union plus resolvable aliases"
-    );
-    assert!(
-        !ids.contains(&"nonexistent-alias"),
-        "an alias pointing at nothing must not be advertised"
-    );
-
-    // `shared` lives on both boards; the extension field should say so.
-    let shared = body["data"]
+    let pool_entry = body["data"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["id"] == "shared")
+        .find(|m| m["id"] == "fast")
         .unwrap();
-    let ups: Vec<&str> = shared["upstreams"]
+    assert_eq!(pool_entry["owned_by"], "mini-router-pool");
+    assert_eq!(pool_entry["pool_members"][0], "openai:gpt-4o-mini");
+    assert_eq!(pool_entry["pool_members"][1], "anthropic:claude-haiku-4-5");
+
+    // The same catalogue, in Anthropic's shape.
+    let ant = Req::get(format!("http://{addr}/v1/models"))
+        .anthropic()
+        .send()
+        .await;
+    let body = ant.json();
+    assert!(body.get("object").is_none());
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["data"][0]["type"], "model");
+    assert!(body["data"][0]["created_at"]
+        .as_str()
+        .unwrap()
+        .ends_with('Z'));
+    let ids: Vec<&str> = body["data"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|u| u.as_str().unwrap())
+        .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ups, vec!["a", "b"]);
+    assert_eq!(ids, vec!["claude-haiku-4-5", "fast", "gpt-4o-mini"]);
 
-    // Single-model lookup, and a 404 for something nobody serves.
-    let one = get(&format!("http://{addr}/v1/models/shared")).await;
+    // Explicit prefixes force a dialect regardless of headers.
+    let forced = Req::get(format!("http://{addr}/anthropic/v1/models"))
+        .send()
+        .await;
+    assert_eq!(forced.json()["data"][0]["type"], "model");
+
+    // A single model, and a 404 for one nobody has.
+    let one = get(&format!("http://{addr}/v1/models/fast")).await;
     assert_eq!(one.status, 200);
-    assert_eq!(one.json()["id"], "shared");
-    let missing = get(&format!("http://{addr}/v1/models/nope")).await;
-    assert_eq!(missing.status, 404);
+    assert_eq!(one.json()["id"], "fast");
+    assert_eq!(
+        get(&format!("http://{addr}/v1/models/nope")).await.status,
+        404
+    );
 }
 
 #[tokio::test]
-async fn rewrites_an_alias_before_forwarding() {
-    let mock = start_mock("board-a", &["qwen2.5:0.5b"]).await;
+async fn aliases_resolve_onto_pools_and_models() {
+    let (a, _b, addr_unused) = pool_setup().await;
+    let _ = addr_unused;
+    let b = start_mock("anthropic2", Anthropic, &["claude-haiku-4-5"]).await;
     let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
+        r#"{QUIET}{}{}
         [alias]
-        "gpt-3.5-turbo" = "qwen2.5:0.5b"
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        models = ["qwen2.5:0.5b"]
+        "gpt-3.5-turbo" = "fast"
+        "dangling" = "nothing-serves-this"
+        [pool.fast]
+        members = [{{ upstream = "openai", model = "gpt-4o-mini" }}]
         "#,
-        mock.base_url()
+        a.upstream_toml(),
+        b.upstream_toml()
     ))
     .await;
 
-    let res = chat(addr, "gpt-3.5-turbo").await;
+    // An app hard-coded to gpt-3.5-turbo lands on the pool.
+    let res = openai_chat(addr, "gpt-3.5-turbo").send().await;
     assert_eq!(res.status, 200, "body: {}", res.body);
-    assert_eq!(
-        mock.last_model().as_deref(),
-        Some("qwen2.5:0.5b"),
-        "the upstream should receive the real model name, not the alias"
-    );
-}
+    assert_eq!(res.upstream(), Some("openai"));
+    assert_eq!(res.model(), Some("gpt-4o-mini"));
 
-#[tokio::test]
-async fn streams_without_buffering_the_response() {
-    let mock = start_mock("board-a", &[]).await;
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        "#,
-        mock.base_url()
-    ))
-    .await;
-
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri(format!("http://{addr}/v1/chat/completions"))
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::json!({"model": "m", "messages": [], "stream": true}).to_string(),
-        ))
-        .unwrap();
-
-    let started = Instant::now();
-    let resp = client().request(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers().get("content-type").unwrap(),
-        "text/event-stream"
-    );
-
-    let mut body = resp.into_body();
-    let mut first_chunk_at = None;
-    let mut collected = String::new();
-    let mut frames = 0;
-    while let Some(frame) = body.frame().await {
-        let frame = frame.unwrap();
-        if let Some(data) = frame.data_ref() {
-            if first_chunk_at.is_none() {
-                first_chunk_at = Some(started.elapsed());
-            }
-            frames += 1;
-            collected.push_str(&String::from_utf8_lossy(data));
-        }
-    }
-
-    let total = started.elapsed();
-    let first = first_chunk_at.expect("at least one chunk should arrive");
-
-    assert!(collected.contains("tok0"), "got: {collected}");
-    assert!(collected.contains("[DONE]"), "got: {collected}");
-    assert!(frames > 1, "expected multiple frames, got {frames}");
-    // The mock spaces its chunks out. If the router buffered the body, the
-    // first chunk would land at the same time as the last one.
-    assert!(
-        first < total / 2,
-        "first chunk at {first:?} but stream finished at {total:?}: body looks buffered"
-    );
-}
-
-#[tokio::test]
-async fn max_concurrency_is_enforced_per_upstream() {
-    let mock = start_mock("small-board", &[]).await;
-    mock.set_delay(Duration::from_millis(150));
-
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [server]
-        queue_timeout_secs = 30
-        [[upstream]]
-        name = "small-board"
-        url = "{}"
-        max_concurrency = 1
-        "#,
-        mock.base_url()
-    ))
-    .await;
-
-    let mut tasks = Vec::new();
-    for _ in 0..4 {
-        tasks.push(tokio::spawn(async move { chat(addr, "m").await }));
-    }
-    for t in tasks {
-        let res = t.await.unwrap();
-        assert_eq!(res.status, 200, "body: {}", res.body);
-    }
-
-    assert_eq!(mock.hits(), 4);
-    assert_eq!(
-        mock.peak_inflight(),
-        1,
-        "max_concurrency = 1 must serialise requests, peak was {}",
-        mock.peak_inflight()
-    );
-}
-
-#[tokio::test]
-async fn queue_timeout_sheds_load_instead_of_hanging() {
-    let mock = start_mock("slow-board", &[]).await;
-    mock.set_delay(Duration::from_millis(600));
-
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [server]
-        queue_timeout_secs = 1
-        [balance]
-        retries = 0
-        [[upstream]]
-        name = "slow-board"
-        url = "{}"
-        max_concurrency = 1
-        "#,
-        mock.base_url()
-    ))
-    .await;
-
-    // Three requests, each taking 600 ms, against one slot and a 1 s queue:
-    // the last one cannot possibly be served in time.
-    let tasks: Vec<_> = (0..3)
-        .map(|_| tokio::spawn(async move { chat(addr, "m").await }))
+    let ids: Vec<String> = get(&format!("http://{addr}/v1/models")).await.json()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_owned())
         .collect();
-    let mut statuses: Vec<u16> = Vec::new();
+    assert!(ids.contains(&"gpt-3.5-turbo".to_string()));
+    assert!(
+        !ids.contains(&"dangling".to_string()),
+        "an alias pointing at nothing must not be advertised: {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Everything else
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_untranslatable_endpoint_only_reaches_its_own_dialect() {
+    let oai = start_mock("oai", Openai, &["m"]).await;
+    let ant = start_mock("ant", Anthropic, &["m"]).await;
+    let addr = start_router(&format!(
+        "{QUIET}{}{}",
+        ant.upstream_toml(),
+        oai.upstream_toml()
+    ))
+    .await;
+
+    // Embeddings have no Anthropic equivalent, so the Anthropic provider must
+    // be skipped rather than sent something it cannot answer.
+    let res = Req::post(
+        format!("http://{addr}/v1/embeddings"),
+        json!({"model": "m", "input": "hello"}),
+    )
+    .send()
+    .await;
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    assert_eq!(res.upstream(), Some("oai"));
+    assert_eq!(ant.hits(), 0);
+}
+
+#[tokio::test]
+async fn max_concurrency_is_enforced_per_provider() {
+    let p = start_mock("slow", Openai, &["m"]).await;
+    p.set_delay(Duration::from_millis(120));
+    let addr = start_router(&format!(
+        r#"{QUIET}
+        [[upstream]]
+        name = "slow"
+        url = "{}"
+        max_concurrency = 1
+        models = ["m"]
+        "#,
+        p.base_url()
+    ))
+    .await;
+
+    let tasks: Vec<_> = (0..4)
+        .map(|_| tokio::spawn(async move { openai_chat(addr, "m").send().await }))
+        .collect();
     for t in tasks {
-        statuses.push(t.await.unwrap().status.as_u16());
+        assert_eq!(t.await.unwrap().status, 200);
     }
-    statuses.sort_unstable();
+    assert_eq!(p.hits(), 4);
     assert_eq!(
-        statuses,
-        vec![200, 200, 429],
-        "expected the third request to be shed with 429"
+        p.peak_inflight(),
+        1,
+        "max_concurrency = 1 must serialise requests"
     );
 }
 
 #[tokio::test]
-async fn fallback_only_upstream_is_held_back() {
-    let primary = start_mock("primary", &["shared"]).await;
-    let cloud = start_mock("cloud", &["shared", "premium"]).await;
-
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [[upstream]]
-        name = "primary"
-        url = "{}"
-        models = ["shared"]
-        [[upstream]]
-        name = "cloud"
-        url = "{}"
-        models = ["shared", "premium"]
-        fallback_only = true
-        "#,
-        primary.base_url(),
-        cloud.base_url()
-    ))
-    .await;
-
-    // A model both can serve goes to the local board.
-    for _ in 0..5 {
-        let res = chat(addr, "shared").await;
-        assert_eq!(res.upstream(), Some("primary"));
-    }
-    assert_eq!(cloud.hits(), 0);
-
-    // A model only the fallback serves reaches it.
-    let res = chat(addr, "premium").await;
-    assert_eq!(res.status, 200);
-    assert_eq!(res.upstream(), Some("cloud"));
-    assert_eq!(cloud.hits(), 1);
-}
-
-#[tokio::test]
-async fn health_probing_discovers_models_and_removes_dead_boards() {
-    let mock = start_mock("board-a", &["discovered-model"]).await;
+async fn health_probing_discovers_models_and_drops_dead_providers() {
+    let p = start_mock("ant", Anthropic, &["discovered-claude"]).await;
     let addr = start_router(&format!(
         r#"
         [health]
@@ -499,182 +956,105 @@ async fn health_probing_discovers_models_and_removes_dead_boards() {
         success_threshold = 1
         cooldown_secs = 30
         [[upstream]]
-        name = "board-a"
+        name = "ant"
         url = "{}"
+        protocol = "anthropic"
+        api_key = "sk-x"
         "#,
-        mock.base_url()
+        p.base_url()
     ))
     .await;
 
     let models_url = format!("http://{addr}/v1/models");
     wait_until("model discovery", Duration::from_secs(10), || {
         let url = models_url.clone();
-        async move { get(&url).await.body.contains("discovered-model") }
+        async move { get(&url).await.body.contains("discovered-claude") }
     })
     .await;
 
-    // Kill the board and wait for it to drop out of rotation.
-    mock.set_health_status(500);
+    p.set_health_status(500);
     let ready_url = format!("http://{addr}/readyz");
-    wait_until(
-        "upstream to be taken out of rotation",
-        Duration::from_secs(10),
-        || {
-            let url = ready_url.clone();
-            async move { get(&url).await.status == 503 }
-        },
-    )
+    wait_until("provider to drop out", Duration::from_secs(10), || {
+        let url = ready_url.clone();
+        async move { get(&url).await.status == 503 }
+    })
     .await;
 
     let admin = get(&format!("http://{addr}/admin/upstreams")).await;
     assert_eq!(admin.json()["upstreams"][0]["health"], "down");
-    assert!(admin.json()["upstreams"][0]["last_error"]
-        .as_str()
-        .unwrap()
-        .contains("500"));
+    assert_eq!(admin.json()["upstreams"][0]["protocol"], "anthropic");
 }
 
 #[tokio::test]
-async fn admin_and_metrics_report_traffic() {
-    let mock = start_mock("board-a", &["m"]).await;
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [balance]
-        strategy = "least-conn"
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        models = ["m"]
-        max_concurrency = 3
-        "#,
-        mock.base_url()
-    ))
-    .await;
+async fn admin_and_metrics_report_traffic_and_translation() {
+    let (_a, b, addr) = pool_setup().await;
 
     assert_eq!(get(&format!("http://{addr}/healthz")).await.status, 200);
     assert_eq!(get(&format!("http://{addr}/readyz")).await.status, 200);
 
-    for _ in 0..3 {
-        assert_eq!(chat(addr, "m").await.status, 200);
-    }
-
-    let metrics = get(&format!("http://{addr}/metrics")).await;
-    assert_eq!(metrics.status, 200);
-    assert!(
-        metrics.body.contains("mini_router_requests_total 3"),
-        "{}",
-        metrics.body
+    // Two passthrough, one translated.
+    assert_eq!(openai_chat(addr, "fast").send().await.status, 200);
+    assert_eq!(openai_chat(addr, "gpt-4o-mini").send().await.status, 200);
+    assert_eq!(
+        openai_chat(addr, "claude-haiku-4-5").send().await.status,
+        200
     );
-    assert!(metrics
+    assert_eq!(b.hits(), 1);
+
+    let m = get(&format!("http://{addr}/metrics")).await;
+    assert_eq!(m.status, 200);
+    assert!(
+        m.body.contains("mini_router_requests_total 3"),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body.contains("mini_router_translated_total 1"),
+        "{}",
+        m.body
+    );
+    assert!(m
         .body
-        .contains("mini_router_responses_total{class=\"2xx\"} 3"));
-    assert!(metrics
+        .contains(r#"mini_router_responses_total{class="2xx"} 3"#));
+    assert!(m
         .body
-        .contains("mini_router_upstream_requests_total{upstream=\"board-a\"} 3"));
-    assert!(metrics
+        .contains(r#"mini_router_upstream_info{upstream="anthropic",protocol="anthropic"} 1"#));
+    assert!(m
         .body
-        .contains("mini_router_upstream_up{upstream=\"board-a\"} 1"));
-    assert!(metrics
-        .body
-        .contains("mini_router_upstream_inflight{upstream=\"board-a\"} 0"));
+        .contains(r#"mini_router_upstream_info{upstream="openai",protocol="openai"} 1"#));
 
     let admin = get(&format!("http://{addr}/admin/upstreams")).await;
     let body = admin.json();
-    assert_eq!(body["strategy"], "least-conn");
-    assert_eq!(body["upstreams"][0]["name"], "board-a");
-    assert_eq!(body["upstreams"][0]["total_requests"], 3);
-    assert_eq!(body["upstreams"][0]["max_concurrency"], 3);
-    assert_eq!(body["upstreams"][0]["health"], "up");
+    assert_eq!(body["strategy"], "priority");
+    assert_eq!(body["spillover"], "any-error");
+    assert_eq!(body["pools"][0]["name"], "fast");
+    assert_eq!(body["pools"][0]["members"][0]["upstream"], "openai");
+    assert_eq!(body["pools"][0]["members"][0]["available"], true);
 }
 
 #[tokio::test]
-async fn round_robin_spreads_traffic_evenly() {
-    let a = start_mock("a", &["m"]).await;
-    let b = start_mock("b", &["m"]).await;
+async fn unknown_paths_and_oversized_bodies_are_rejected() {
+    let p = start_mock("oai", Openai, &["m"]).await;
     let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [balance]
-        strategy = "round-robin"
-        [[upstream]]
-        name = "a"
-        url = "{}"
-        models = ["m"]
-        [[upstream]]
-        name = "b"
-        url = "{}"
-        models = ["m"]
-        "#,
-        a.base_url(),
-        b.base_url()
-    ))
-    .await;
-
-    for _ in 0..10 {
-        assert_eq!(chat(addr, "m").await.status, 200);
-    }
-    assert_eq!(a.hits(), 5);
-    assert_eq!(b.hits(), 5);
-}
-
-#[tokio::test]
-async fn unknown_endpoints_and_oversized_bodies_are_rejected() {
-    let mock = start_mock("board-a", &[]).await;
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
+        r#"{QUIET}
         [server]
         max_body_bytes = 1024
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        "#,
-        mock.base_url()
+        {}"#,
+        p.upstream_toml()
     ))
     .await;
 
+    // Not an API path: must 404 rather than be forwarded to a paid provider.
     let unknown = get(&format!("http://{addr}/not-a-thing")).await;
     assert_eq!(unknown.status, 404);
     assert_eq!(unknown.json()["error"]["type"], "not_found_error");
 
-    let huge = request(
-        "POST",
-        &format!("http://{addr}/v1/chat/completions"),
-        Some(serde_json::json!({"model": "m", "prompt": "x".repeat(4096)})),
-        None,
+    let huge = Req::post(
+        format!("http://{addr}/v1/chat/completions"),
+        json!({"model": "m", "messages": [{"role": "user", "content": "x".repeat(4096)}]}),
     )
+    .send()
     .await;
     assert_eq!(huge.status, 413);
-    assert_eq!(mock.hits(), 0);
-}
-
-#[tokio::test]
-async fn forwards_endpoints_it_does_not_know_about() {
-    let mock = start_mock("board-a", &[]).await;
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 0
-        [[upstream]]
-        name = "board-a"
-        url = "{}"
-        "#,
-        mock.base_url()
-    ))
-    .await;
-
-    let res = request(
-        "POST",
-        &format!("http://{addr}/v1/embeddings"),
-        Some(serde_json::json!({"model": "embed-me", "input": "hello"})),
-        None,
-    )
-    .await;
-    assert_eq!(res.status, 200, "body: {}", res.body);
-    assert_eq!(res.upstream(), Some("board-a"));
-    assert_eq!(mock.last_model().as_deref(), Some("embed-me"));
+    assert_eq!(p.hits(), 0);
 }

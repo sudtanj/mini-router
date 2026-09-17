@@ -9,7 +9,8 @@ use mini_router::state::{init_crypto, AppState};
 use mini_router::{health, router, version_line};
 
 const USAGE: &str = "\
-mini-router -- a tiny OpenAI-compatible LLM aggregator and load balancer
+mini-router -- one OpenAI- and Anthropic-compatible endpoint over every
+              LLM provider you use
 
 USAGE:
     mini-router [OPTIONS]
@@ -105,10 +106,32 @@ fn main() -> ExitCode {
 
     if args.check {
         println!(
-            "configuration ok: {} upstream(s), strategy {}",
+            "configuration ok: {} provider(s), {} pool(s), strategy {}",
             cfg.upstreams.len(),
+            cfg.pools.len(),
             cfg.balance.strategy
         );
+        for up in &cfg.upstreams {
+            println!(
+                "  provider {:<16} {:<10} {}{}",
+                up.name,
+                up.protocol.to_string(),
+                up.url,
+                if up.resolve_key().is_some() {
+                    ""
+                } else {
+                    "  (no api key resolved)"
+                }
+            );
+        }
+        for (name, pool) in &cfg.pools {
+            let members: Vec<String> = pool
+                .members
+                .iter()
+                .map(|m| format!("{}:{}", m.upstream, m.model))
+                .collect();
+            println!("  pool     {:<16} {}", name, members.join(" -> "));
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -153,18 +176,27 @@ async fn run(cfg: Config, workers: usize) -> Result<(), Box<dyn std::error::Erro
     let state = Arc::new(AppState::new(cfg));
 
     tracing::info!(
-        "{} listening on {listen} | {} upstream(s) | strategy {} | {workers} worker thread(s)",
+        "{} listening on {listen} | {} provider(s) | {} pool(s) | strategy {} | {workers} worker thread(s)",
         version_line(),
         state.upstreams.len(),
+        state.cfg.pools.len(),
         state.balancer.strategy(),
     );
     for up in &state.upstreams {
         tracing::info!(
             upstream = %up.name,
+            protocol = %up.cfg.protocol,
             url = %up.cfg.url,
             max_concurrency = up.cfg.max_concurrency,
-            weight = up.cfg.weight,
-            "upstream registered"
+            has_key = up.api_key.is_some(),
+            "provider registered"
+        );
+    }
+    for (name, pool) in &state.cfg.pools {
+        tracing::info!(
+            pool = %name,
+            members = pool.members.len(),
+            "pool registered"
         );
     }
 

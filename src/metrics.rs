@@ -23,6 +23,8 @@ pub struct Metrics {
     pub no_upstream_total: AtomicU64,
     pub unauthorized_total: AtomicU64,
     pub streaming_total: AtomicU64,
+    pub translated_total: AtomicU64,
+    pub spilled_out_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -44,6 +46,8 @@ impl Metrics {
             no_upstream_total: AtomicU64::new(0),
             unauthorized_total: AtomicU64::new(0),
             streaming_total: AtomicU64::new(0),
+            translated_total: AtomicU64::new(0),
+            spilled_out_total: AtomicU64::new(0),
         }
     }
 
@@ -86,8 +90,20 @@ impl Metrics {
         );
         counter(
             &mut out,
+            "mini_router_translated_total",
+            "Responses translated between the OpenAI and Anthropic dialects.",
+            self.get(&self.translated_total),
+        );
+        counter(
+            &mut out,
+            "mini_router_spilled_out_total",
+            "Requests that exhausted every candidate provider.",
+            self.get(&self.spilled_out_total),
+        );
+        counter(
+            &mut out,
             "mini_router_retries_total",
-            "Attempts that were retried on another upstream.",
+            "Attempts that spilled over to another provider.",
             self.get(&self.retries_total),
         );
         counter(
@@ -144,6 +160,19 @@ impl Metrics {
             upstreams,
             |u| if u.health == Health::Down { 0.0 } else { 1.0 },
         );
+        out.push_str(
+            "# HELP mini_router_upstream_info Static provider facts, carried as labels.\n",
+        );
+        out.push_str("# TYPE mini_router_upstream_info gauge\n");
+        for u in upstreams {
+            let _ = writeln!(
+                out,
+                "mini_router_upstream_info{{upstream=\"{}\",protocol=\"{}\"}} 1",
+                escape_label(&u.name),
+                u.protocol
+            );
+        }
+
         labelled_gauge(
             &mut out,
             "mini_router_upstream_inflight",
@@ -257,7 +286,8 @@ mod tests {
     fn status(name: &str) -> UpstreamStatus {
         UpstreamStatus {
             name: name.into(),
-            url: "http://127.0.0.1:11434/v1".into(),
+            url: "https://api.openai.com/v1".into(),
+            protocol: crate::protocol::Protocol::Openai,
             health: Health::Up,
             inflight: 2,
             max_concurrency: 4,
@@ -266,7 +296,7 @@ mod tests {
             ttfb_ewma_ms: 12.5,
             total_requests: 7,
             total_failures: 1,
-            models: vec!["qwen2.5:0.5b".into()],
+            models: vec!["gpt-4o-mini".into()],
             last_error: None,
         }
     }
@@ -292,6 +322,9 @@ mod tests {
         assert!(text.contains("mini_router_requests_total 3"));
         assert!(text.contains("mini_router_upstream_inflight{upstream=\"opi-a\"} 2"));
         assert!(text.contains("mini_router_upstream_ttfb_ewma_ms{upstream=\"opi-a\"} 12.500"));
+        assert!(
+            text.contains("mini_router_upstream_info{upstream=\"opi-a\",protocol=\"openai\"} 1")
+        );
     }
 
     #[test]

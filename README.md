@@ -1,63 +1,60 @@
 # mini-router
 
-A small OpenAI-compatible **LLM aggregator and load balancer**, built to run on
-a single-board computer.
+**One endpoint in front of every LLM provider you already pay for.**
 
-You have an Orange Pi Zero 3 running a 1.5B model. Maybe you have three of
-them, or two boards and a workstation that is sometimes on. mini-router puts
-one OpenAI-compatible endpoint in front of all of them: it knows which box has
-which model, which box is alive, which box is busy, and where the next request
-should go.
+Point any OpenAI client *or* any Anthropic client at mini-router, ask for a
+model, and it picks a provider, translates the dialect if it has to, and falls
+through to the next provider the moment anything goes wrong.
 
-It is a proxy, not a runtime. llama.cpp, Ollama and vLLM do the hard part;
-mini-router is the part that should cost you nothing.
+The models are remote. The router is not: it is built to sit on a small
+always-on box on your own network — an Orange Pi Zero 3 is the design target —
+in 2.4 MB of binary and under 5 MB of RAM.
 
 ```
-                    ┌──────────────────────────────┐
-  any OpenAI        │         mini-router          │      ┌──────────────┐
-  client       ───► │  auth → route → balance →    │ ───► │ opi-zero3 #1 │ llama.cpp
-  (SDK, curl,       │  admission control → stream  │      ├──────────────┤
-   Open WebUI)      │                              │ ───► │ opi-zero3 #2 │ ollama
-                    │  health probes + discovery   │      ├──────────────┤
-                    └──────────────────────────────┘ ───► │ cloud (spill)│ fallback_only
-                                                          └──────────────┘
+  OpenAI SDK      ─┐                                        ┌─► api.openai.com
+  (base_url=       │   ┌──────────────────────────┐         │
+   .../v1)         ├──►│        mini-router       │────────►├─► api.anthropic.com
+                   │   │                          │         │
+  Anthropic SDK   ─┘   │  auth → pool → order →   │         ├─► api.groq.com
+  (base_url=           │  translate → spill over  │         │
+   http://pi:8080)     └──────────────────────────┘         └─► openrouter.ai
 ```
+
+Either front door reaches either kind of provider. An OpenAI-shaped request can
+be served by Anthropic and come back OpenAI-shaped; an Anthropic-shaped request
+can be served by Groq and come back Anthropic-shaped. Streams, tool calls and
+images included.
+
+## Why
+
+If you have accounts at two or three providers, every app you run needs to know
+which one it is talking to, which key to use, and what to do when that provider
+is rate-limited. mini-router makes that one address and one key. Behind it:
+
+- **Pools.** `fast` is `gpt-4o-mini`, or `claude-haiku-4-5` when OpenAI is
+  having a bad day. Your app just asks for `fast`.
+- **Spillover on anything.** Not only rate limits: a refused connection, a
+  timeout, an expired key, a 400, a model the provider has never heard of — all
+  of them move the request to the next member.
+- **Protocol translation**, so the pool can span providers that do not speak the
+  same dialect.
 
 ## Measured footprint
 
-Release build, x86_64, `--profile release`, against a mock upstream streaming
-SSE. An `aarch64` board lands in the same neighbourhood.
+Release build, x86_64, streaming SSE from a mock provider **through the
+translator** (the expensive path).
 
 | | |
 |---|---|
-| Binary, stripped | **2.3 MB** (1.3 MB with `--no-default-features`, i.e. no TLS) |
-| Idle RSS | **4.4 MB** |
-| RSS during 16 concurrent streamed completions | **5.4 MB** |
-| Dependencies | 93 crates, no C toolchain needed unless you enable TLS |
+| Binary, stripped | **2.4 MB** (1.4 MB with `--no-default-features`, no TLS) |
+| Idle RSS | **4.8 MB** |
+| RSS during 48 concurrent translated streams | **4.8 MB** — unchanged |
+| Dependencies | 93 crates |
 
-Memory stays flat under load because response bodies are never buffered: tokens
-are forwarded frame by frame as they arrive.
-
-## What it does
-
-- **Aggregates models.** `GET /v1/models` returns the union of every model your
-  boards report, discovered automatically and refreshed on each health probe.
-- **Balances load** with five strategies, including a latency-aware
-  power-of-two-choices that sheds work from a struggling board to a fast one.
-- **Admission control.** `max_concurrency` per upstream, with a queue in front
-  and a timeout on the queue. Two 1.5B generations do not fit in 1 GB; this is
-  the setting that stops them meeting.
-- **Fails over.** A refused connection, a timeout or a 5xx moves the request to
-  the next upstream that serves the model. A box that keeps failing drops out of
-  rotation and is retried after a cooldown.
-- **Streams properly.** SSE passes straight through, and the upstream's slot is
-  held until the last token, not until the headers.
-- **Aliases models**, so an app hard-coded to `gpt-3.5-turbo` reaches whatever
-  you actually run.
-- **Keeps credentials separate.** Clients authenticate with your key; each
-  upstream gets its own, injected by the router and never forwarded from the
-  client.
-- **Exposes Prometheus metrics** and a JSON view of the whole shelf.
+Memory is flat under load because nothing is buffered. A same-dialect response
+is forwarded frame by frame without being read; a translated one goes through
+an incremental state machine, still frame by frame. A twenty-minute generation
+costs the same as a one-line one.
 
 ## Quick start
 
@@ -69,33 +66,54 @@ cargo build --release
 cp mini-router.example.toml mini-router.toml
 $EDITOR mini-router.toml
 
+export OPENAI_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-ant-...
 ./target/release/mini-router --config mini-router.toml
 ```
 
-The smallest configuration that does something useful:
+A configuration that does something useful:
 
 ```toml
 [[upstream]]
-name = "opi-zero3"
-url = "http://127.0.0.1:11434/v1"
-max_concurrency = 1
+name = "openai"
+url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[[upstream]]
+name = "anthropic"
+url = "https://api.anthropic.com/v1"
+protocol = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[pool.fast]
+members = [
+  { upstream = "openai",    model = "gpt-4o-mini" },
+  { upstream = "anthropic", model = "claude-haiku-4-5" },
+]
 ```
 
-Then point any OpenAI client at it:
+Now every client can use it, whichever SDK it was written against:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://pi.local:8080/v1", api_key="not-needed")
+client.chat.completions.create(model="fast", messages=[{"role": "user", "content": "hi"}])
+
+from anthropic import Anthropic
+client = Anthropic(base_url="http://pi.local:8080", api_key="not-needed")
+client.messages.create(model="fast", max_tokens=256,
+                       messages=[{"role": "user", "content": "hi"}])
+```
+
+Both of those calls can end up at the *same* provider. `fast` resolves to
+whichever member is healthy, and the answer is reshaped to match whichever SDK
+asked.
 
 ```sh
 curl http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model": "qwen2.5:1.5b",
-       "messages": [{"role": "user", "content": "why is the sky blue?"}],
-       "stream": true}'
-```
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://opi.local:8080/v1", api_key="not-needed")
-print(client.models.list())
+  -d '{"model": "fast", "stream": true,
+       "messages": [{"role": "user", "content": "why is the sky blue?"}]}'
 ```
 
 Check the configuration without starting anything:
@@ -104,94 +122,134 @@ Check the configuration without starting anything:
 mini-router --config mini-router.toml --check
 ```
 
-## Building for an Orange Pi Zero 3
+## Pools
 
-The Zero 3 is `aarch64`. Build a static binary on your workstation and copy it
-over — compiling on the board itself works but takes a while, and linking wants
-more RAM than a 1 GB board is happy to give.
+A pool is one client-facing name over several provider models, tried in the
+order you wrote them:
 
-```sh
-rustup target add aarch64-unknown-linux-musl
-cargo install cross          # uses Docker/Podman, no cross-toolchain to install
-
-cross build --release --target aarch64-unknown-linux-musl
-scp target/aarch64-unknown-linux-musl/release/mini-router orangepi@opi.local:
+```toml
+[pool.smart]
+description = "The good models, for when it matters"
+members = [
+  { upstream = "anthropic", model = "claude-sonnet-4-5" },
+  { upstream = "openai",    model = "gpt-4o" },
+]
 ```
 
-If every upstream is a plain-HTTP box on your LAN, drop TLS and save a megabyte:
+The first member serves. If it fails — for **any** reason — the second one
+does, and the client never learns there was a problem. Response headers say
+what actually happened:
 
-```sh
-cross build --release --target aarch64-unknown-linux-musl --no-default-features
+| Header | Meaning |
+|---|---|
+| `x-mini-router-upstream` | Which provider answered |
+| `x-mini-router-model` | Which model id it was asked for |
+| `x-mini-router-translated` | e.g. `anthropic->openai`, absent when untranslated |
+
+Pools can override the global strategy — useful to burn two accounts' quota
+evenly rather than exhausting one and then the other:
+
+```toml
+[pool.spread]
+strategy = "round-robin"
+members = [
+  { upstream = "openai", model = "gpt-4o-mini", weight = 1 },
+  { upstream = "groq",   model = "llama-3.3-70b-versatile", weight = 3 },
+]
 ```
 
-Installing as a service:
+| Strategy | Use it when |
+|---|---|
+| `priority` *(default)* | Declaration order. "Cheap provider first, good one as backup." |
+| `round-robin` | Spread evenly across interchangeable accounts. |
+| `weighted` | One account should take *n* times the traffic. |
+| `least-conn` | Long generations, and you want the idle provider. |
+| `p2c-latency` | Providers whose speed varies; picks on time-to-first-byte × queue depth. |
 
-```sh
-sudo install -m755 mini-router /usr/local/bin/
-sudo install -m644 -D mini-router.toml /etc/mini-router/mini-router.toml
-sudo install -m644 deploy/mini-router.service /etc/systemd/system/
-sudo systemctl enable --now mini-router
+Whatever the strategy, the ordering is a full list — everything not picked
+first is the spillover path, in order.
+
+## Spillover
+
+The default is `spillover = "any-error"`: a candidate is used up by anything
+that is not a 2xx, plus every transport failure.
+
+```
+connection refused ─┐
+timeout             │
+401 bad key         ├──► try the next member
+404 unknown model   │
+429 rate limited    │
+500 / 502 / 529     ┘
 ```
 
-The unit in `deploy/` runs as a dedicated user with a hardened sandbox and a
-`MemoryMax` of 64 MB — generous by a factor of ten, and a safety net on a board
-where the OOM killer would otherwise pick the model server.
+When the list runs out, the client gets **the last provider's own error**,
+status and message intact, reshaped into the client's dialect — that is far
+more useful than a synthetic "all upstreams failed".
 
-There is also a `deploy/Dockerfile` if you would rather run it in a container.
+A provider that answers `429` with `Retry-After` is parked for exactly that
+long (up to `health.max_cooldown_secs`) instead of being asked again.
+
+Narrow it if you would rather a genuine `400` reach the client immediately:
+
+```toml
+[balance]
+spillover = "status-list"
+retry_on_status = [429, 500, 502, 503, 529]
+```
+
+## Protocol translation
+
+| Client speaks | Provider speaks | What happens |
+|---|---|---|
+| OpenAI | OpenAI | Passthrough, zero-copy |
+| Anthropic | Anthropic | Passthrough, zero-copy |
+| OpenAI | Anthropic | Translated both ways |
+| Anthropic | OpenAI | Translated both ways |
+
+What survives the trip: system prompts (moved between the top-level `system`
+field and a `system` message), multi-turn conversations, tool definitions, tool
+calls and tool results, images (base64 and URL), `stop`/`stop_sequences`,
+temperature and top-p, token usage, and stop/finish reasons.
+
+Streaming is translated incrementally. An Anthropic
+`message_start` / `content_block_delta` / `message_stop` sequence becomes a run
+of OpenAI `chat.completion.chunk`s ending in `data: [DONE]`, and vice versa —
+tool-call argument fragments reassembled correctly in both directions, and the
+stream properly terminated even if the provider hangs up mid-generation.
+
+Two things are deliberately dropped rather than mistranslated: Anthropic's
+`top_k` (no OpenAI equivalent) and extended-thinking blocks in the
+OpenAI→Anthropic direction (they need a signature we cannot forge). Anthropic
+thinking deltas going the other way surface as `reasoning_content`, which is
+what the OpenAI-compatible providers that expose reasoning have settled on.
+
+Endpoints with no counterpart — embeddings, rerank, audio — are forwarded
+unchanged, and only ever to a provider that already speaks the dialect they
+were written in.
 
 ## Endpoints
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | Routed and streamed |
-| `POST /v1/completions`, `/v1/embeddings`, … | Routed the same way |
-| `ANY /v1/*` | Anything else is forwarded, so new upstream endpoints keep working |
-| `GET /v1/models` | Aggregated catalogue across all upstreams, plus aliases |
-| `GET /v1/models/{id}` | One model, or 404 if nothing serves it |
+| `POST /v1/chat/completions` | OpenAI dialect in |
+| `POST /v1/messages` | Anthropic dialect in |
+| `GET /v1/models` | Aggregated catalogue, in whichever dialect you asked |
+| `GET /v1/models/{id}` | One model or pool |
+| `ANY /v1/*` | Anything else, forwarded to a matching provider |
 | `GET /healthz` | Liveness. Unauthenticated; what a supervisor restarts on |
-| `GET /readyz` | 200 if at least one upstream is in rotation, else 503 |
+| `GET /readyz` | 200 if any provider is in rotation |
 | `GET /metrics` | Prometheus exposition |
-| `GET /admin/upstreams` | Health, load, latency and models per upstream |
+| `GET /admin/upstreams` | Providers, pools, health, latency, last error |
 
-Every proxied response carries `x-mini-router-upstream`, naming the box that
-answered. When three boards disagree about what a model should say, this is the
-header you want.
-
-## Balancing strategies
-
-Set `balance.strategy`:
-
-| Strategy | Use it when |
-|---|---|
-| `p2c-latency` *(default)* | Mixed hardware. Picks two candidates at random and takes the one with the better time-to-first-byte × queue depth. Follows real capacity without the stampede of pure least-conn. |
-| `least-conn` | Uniform boards, long generations. |
-| `round-robin` | Uniform boards, short and predictable requests. |
-| `weighted` | One box is genuinely *n* times the others; set `weight`. |
-| `first-available` | A primary with spares: everything goes to the first healthy upstream. |
-
-Two flags shape the pool before any strategy runs:
-
-- `max_concurrency` — requests in flight per upstream. Anything over the limit
-  waits up to `server.queue_timeout_secs`, then gets a `429`. On a 1 GB board
-  running a 1.5B model, this should be `1`.
-- `fallback_only` — the upstream is skipped unless no ordinary upstream serves
-  the requested model. This is how a paid cloud endpoint sits behind a shelf of
-  boards without stealing their traffic.
-
-## Health and discovery
-
-Every `health.interval_secs`, each upstream gets a `GET {url}/models`. The
-response does double duty: proof of life, and the list of models that box is
-currently holding. Swap a model on a board and routing follows within one probe
-interval, no restart.
-
-`failure_threshold` consecutive failures — probes or real requests — take an
-upstream out of rotation for `cooldown_secs`. It then gets retried, and needs
-`success_threshold` consecutive successes to be trusted again. An upstream that
-reports no models at all is treated as a wildcard rather than as empty, because
-some llama.cpp builds do not implement `/models`.
+`/v1/models` is the one path both dialects share, so the `anthropic-version`
+header decides which shape comes back — every Anthropic SDK sends it and
+nothing else does. To be explicit, prefix with `/openai/...` or
+`/anthropic/...`.
 
 ## Authentication
+
+Your clients get one key; each provider gets its own.
 
 ```toml
 [server.auth]
@@ -200,24 +258,52 @@ api_keys = ["sk-choose-something-long"]
 api_key_envs = ["MINI_ROUTER_CLIENT_KEY"]   # or keep it out of the file
 ```
 
-Keys are compared in constant time. `/healthz` and `/readyz` stay open so a
-supervisor can reach them; `/metrics` and `/admin/*` require a key when
-`require_auth` is on.
+Client keys are accepted as `Authorization: Bearer` *or* `x-api-key`, so both
+SDKs work, and are compared in constant time. The client's credential is never
+forwarded: it is replaced with the provider's own, in the header that provider
+expects (`Authorization: Bearer` for OpenAI-compatible, `x-api-key` plus
+`anthropic-version` for Anthropic).
 
-Each upstream's own credential is set per-block with `api_key` or `api_key_env`.
-The client's `Authorization` header is never forwarded — it is replaced.
+`/healthz` and `/readyz` stay open for supervisors; `/metrics` and `/admin/*`
+need a key when `require_auth` is on.
 
-## Configuration
+## Health and discovery
 
-Everything is one TOML file, and every key has a default that is sensible on a
-small board. `mini-router.example.toml` documents all of them inline. Unknown
-keys are a hard error rather than a silent no-op, so a typo fails at `--check`
-rather than at 3am.
+Every `health.interval_secs`, each provider gets a `GET {url}/models` with its
+own credentials. It proves the key still works and refreshes the model list, so
+a provider that adds a model starts serving it within one interval.
 
-| Environment variable | Effect |
-|---|---|
-| `MINI_ROUTER_CONFIG` | Default config path |
-| `MINI_ROUTER_LOG` | `error`/`warn`/`info`/`debug`/`trace`, overrides `server.log_level` |
+`failure_threshold` consecutive failures — probes or real requests — take a
+provider out for `cooldown_secs`, after which it is retried and needs
+`success_threshold` successes to be trusted again.
+
+## Running it on a small board
+
+The Zero 3 is `aarch64`. Build on your workstation and copy the binary over.
+
+```sh
+rustup target add aarch64-unknown-linux-gnu
+sudo apt install gcc-aarch64-linux-gnu      # .cargo/config.toml wires it up
+
+cargo build --release --target aarch64-unknown-linux-gnu
+scp target/aarch64-unknown-linux-gnu/release/mini-router orangepi@pi.local:
+```
+
+Install as a service:
+
+```sh
+sudo install -m755 mini-router /usr/local/bin/
+sudo install -m644 -D mini-router.toml /etc/mini-router/mini-router.toml
+sudo install -m600 -D /dev/null /etc/mini-router/env   # provider keys go here
+sudo install -m644 deploy/mini-router.service /etc/systemd/system/
+sudo systemctl enable --now mini-router
+```
+
+The unit in `deploy/` runs as a transient unprivileged user with a hardened
+sandbox and `MemoryMax=64M` — ten times what it has ever needed. Put the
+provider keys in `/etc/mini-router/env` (`OPENAI_API_KEY=...`, one per line,
+mode 600) and reference them with `api_key_env`, so the config file stays safe
+to commit. There is a `deploy/Dockerfile` too.
 
 ## Metrics
 
@@ -225,11 +311,14 @@ rather than at 3am.
 mini_router_requests_total
 mini_router_responses_total{class="2xx|4xx|5xx"}
 mini_router_streaming_requests_total
+mini_router_translated_total
 mini_router_retries_total
+mini_router_spilled_out_total
 mini_router_queue_timeouts_total
 mini_router_no_upstream_total
 mini_router_unauthorized_total
 mini_router_uptime_seconds
+mini_router_upstream_info{upstream,protocol}
 mini_router_upstream_up{upstream}
 mini_router_upstream_inflight{upstream}
 mini_router_upstream_capacity{upstream}
@@ -238,54 +327,54 @@ mini_router_upstream_requests_total{upstream}
 mini_router_upstream_failures_total{upstream}
 ```
 
-`mini_router_queue_timeouts_total` climbing means the shelf is saturated: add a
-board, or raise `max_concurrency` if there is memory headroom to spare.
-`mini_router_upstream_ttfb_ewma_ms` diverging between boards usually means one
-of them is thermally throttled or swapping.
+`mini_router_spilled_out_total` climbing means requests are exhausting every
+member of a pool — usually a key that expired or a provider-wide outage; check
+`last_error` in `/admin/upstreams`. A high `mini_router_retries_total` with a
+low `spilled_out_total` is the system working as intended.
 
 ## Design notes
 
-Choices that follow directly from "this has to run on a 1 GB board":
-
-- **No buffered response bodies.** A completion body is a wrapper around the
-  upstream's body that forwards frames as they arrive. Memory does not grow with
-  generation length.
-- **The concurrency permit lives as long as the stream.** It is held by the
-  response body wrapper, so it is released when the last token is sent *or* when
-  the client hangs up mid-stream — not when the headers came back.
+- **Nothing is buffered on the streaming path.** Same-dialect responses are a
+  thin wrapper over the provider's body. Translated ones run each frame through
+  an SSE state machine that holds only a partial event.
+- **The concurrency permit lives as long as the stream**, owned by the response
+  body, so it is released when the last token ships *or* when the client hangs
+  up — not when the headers came back.
+- **Ordering is a list, not a pick.** Spillover needs to know who is next, and
+  next after that.
+- **A provider's own error beats ours.** When every candidate fails, the client
+  gets the last real response, translated but otherwise intact.
 - **Atomics on the hot path.** Health, load and latency are atomics; the only
-  lock is around a model list that changes once per probe.
+  lock guards a model list that changes once per probe.
 - **A small dependency tree.** No `rand` (a thread-local xorshift covers
-  power-of-two-choices), no metrics framework (a handful of counters and a
-  string builder), no HTTP client crate beyond `hyper-util`.
-- **512 KB worker stacks and two worker threads by default.** The default
-  2 MB × one-per-core is real memory on a board that has little of it.
-- **The timeout is on headers, not on the response.** A 20-minute generation is
-  not an error; an upstream that never answers is.
+  power-of-two-choices), no metrics framework, no date crate, no HTTP client
+  crate beyond `hyper-util`.
 
 ## Development
 
 ```sh
-cargo test                                    # unit + integration
+cargo test                                    # 127 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo build --release --no-default-features   # the small build
+cargo test --no-default-features              # the no-TLS build
 ```
 
 Minimum supported Rust version is **1.85**, checked in CI against the committed
 `Cargo.lock`.
 
-The integration tests run real HTTP against mock upstreams on ephemeral ports
-and cover failover, streaming, admission control, aliasing, discovery and auth.
-`tests/support/mod.rs` has the harness; adding a case is usually a dozen lines.
+The integration tests run real HTTP against mock providers of both dialects on
+ephemeral ports, and cover the whole four-way matrix, streaming in both
+directions, tool calls across dialects, spillover on every error class,
+`Retry-After` parking, per-provider credentials, pools and the catalogue.
+`tests/support/mod.rs` has the harness.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Status
 
-Early but real: the routing, balancing, failover, streaming and admission
-control paths are covered by tests and work. Not yet here — token accounting,
-config hot-reload, request-level model fallback chains, HTTP/2 to upstreams. See
+Early but real: routing, pools, spillover, translation and streaming are
+covered by tests and work. Not yet here — cost-aware routing, response caching,
+config hot-reload, per-request fallback chains, HTTP/2 to providers. See
 [CHANGELOG.md](CHANGELOG.md).
 
 ## License

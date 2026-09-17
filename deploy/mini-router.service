@@ -6,7 +6,7 @@
 #   sudo systemctl enable --now mini-router
 
 [Unit]
-Description=mini-router: LLM aggregator and load balancer
+Description=mini-router: LLM API aggregator and load balancer
 Documentation=https://github.com/sudtanj/mini-router
 After=network-online.target
 Wants=network-online.target
@@ -16,9 +16,11 @@ Type=exec
 ExecStart=/usr/local/bin/mini-router --config /etc/mini-router/mini-router.toml
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Upstream API keys belong here, not in the config file:
-#   EnvironmentFile=/etc/mini-router/env    (chmod 600)
-# EnvironmentFile=-/etc/mini-router/env
+# Provider API keys belong here, not in the config file. One per line:
+#   OPENAI_API_KEY=sk-...
+#   ANTHROPIC_API_KEY=sk-ant-...
+# Create it mode 600 and reference the names with `api_key_env`.
+EnvironmentFile=-/etc/mini-router/env
 
 Restart=on-failure
 RestartSec=5s
@@ -40,7 +42,8 @@ TasksMax=64
 # Keep the proxy off the model server's cores when they are contended.
 Nice=5
 
-# Sandbox. mini-router reads one config file and talks to the network.
+# Sandbox. mini-router reads one config file, holds provider API keys, and
+# talks to the network. Nothing else.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes

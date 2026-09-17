@@ -1,118 +1,189 @@
 # mini-router configuration
 #
-# Copy to mini-router.toml and edit. Every value below is optional except the
-# [[upstream]] blocks; the defaults are chosen for a 1 GB single-board computer.
+# Copy to mini-router.toml and edit. Only the [[upstream]] blocks are required.
 # Validate a file without starting the server:
 #
 #     mini-router --config mini-router.toml --check
+#
+# The shape of a deployment: mini-router runs on a small always-on box on your
+# network. The models are remote provider APIs you already pay for. Clients on
+# your network point at mini-router instead of at any one provider, and get one
+# OpenAI-compatible endpoint and one Anthropic-compatible endpoint over all of
+# them.
 
 [server]
 listen = "0.0.0.0:8080"
 
-# Tokio worker threads. Keep this small: on a 4-core board the model server
-# wants the cores far more than the proxy does. 0 means one per core.
+# Tokio worker threads. Keep this small: the router spends its life waiting on
+# sockets, not computing. 0 means one per core.
 worker_threads = 2
 
-# Largest request body accepted from a client (8 MiB). Mostly a guard against a
-# runaway client pinning memory on a board that has very little of it.
+# Largest request body accepted from a client (8 MiB).
 max_body_bytes = 8388608
 
-# How long to wait for an upstream to send response *headers*. This is not a
+# Largest non-streamed response the router will translate between dialects.
+# Same-dialect responses stream through untouched at any size.
+max_translate_bytes = 8388608
+
+# How long to wait for a provider to send response *headers*. This is not a
 # limit on generation time: once the first byte arrives, a stream may run for
 # as long as it likes.
 upstream_header_timeout_secs = 120
 
-# How long a request may wait for a free slot when every upstream that serves
-# the model is busy. Exceeding it returns 429 rather than queueing forever.
+# How long a request may wait for a free slot when every candidate provider is
+# at its concurrency limit. Exceeding it returns 429 rather than queueing.
 queue_timeout_secs = 60
 
-# Keep-alive for pooled upstream connections.
+# Keep-alive for pooled provider connections. Worth having: these are TLS
+# connections across the internet, and the handshake is not free.
 pool_idle_timeout_secs = 90
 
 # error | warn | info | debug | trace  (override with MINI_ROUTER_LOG)
 log_level = "info"
 
 [server.auth]
-# Keys clients must present as `Authorization: Bearer <key>`.
-# Leave require_auth = false on a trusted home network; turn it on the moment
-# the port is reachable from anywhere else.
+# Keys your own clients present, as `Authorization: Bearer <key>` (OpenAI SDKs)
+# or `x-api-key: <key>` (Anthropic SDKs). Either header is accepted.
+#
+# Turn this on if anything other than you can reach the port. These keys are
+# what stand between a stray device and your provider bills.
 require_auth = false
 api_keys = []
-# Read additional client keys from the environment, so secrets stay out of the
-# config file:
+# Or keep them out of the config file entirely:
 # api_key_envs = ["MINI_ROUTER_CLIENT_KEY"]
 
 [balance]
-# round-robin      plain rotation
-# least-conn       fewest requests in flight
-# weighted         rotation biased by each upstream's `weight`
-# p2c-latency      power of two choices, compared on time-to-first-byte
-# first-available  always the first healthy upstream (primary + spares)
-strategy = "p2c-latency"
+# priority     declaration order; the first healthy candidate serves, and
+#              anything that fails spills to the next. The default.
+# round-robin  plain rotation
+# least-conn   fewest requests in flight first
+# weighted     rotation biased by `weight`
+# p2c-latency  power of two choices on time-to-first-byte
+strategy = "priority"
 
-# Extra upstreams to try when an attempt fails. 2 means three attempts total.
-retries = 2
+# What counts as a reason to try the next candidate.
+#   any-error    anything that is not a 2xx, plus every transport failure:
+#                a refused connection, a timeout, a rate limit, an expired
+#                key, a model the provider does not have. The default.
+#   status-list  only the statuses in retry_on_status below.
+spillover = "any-error"
 
-# Upstream statuses that trigger a retry elsewhere instead of being passed
-# through to the client.
-retry_on_status = [408, 429, 500, 502, 503, 504]
+# Cap on attempts per request. 0 means "try every candidate", which is what
+# makes spillover actually exhaust the pool.
+max_attempts = 0
+
+# Consulted only when spillover = "status-list".
+retry_on_status = [408, 409, 429, 500, 502, 503, 504, 529]
 
 [health]
-# Seconds between probes. 0 disables active probing entirely, leaving health to
-# be inferred from live traffic.
-interval_secs = 15
-timeout_secs = 5
+# Seconds between probes of each provider. The probe doubles as model
+# discovery. 0 disables it, leaving health to be inferred from live traffic.
+interval_secs = 60
+timeout_secs = 10
 
-# Probe path, appended to each upstream's base URL. The response doubles as
-# model discovery.
+# Probe path, appended to each provider's base URL. Both dialects serve it.
 path = "/models"
 
-failure_threshold = 3   # consecutive failures before an upstream drops out
+failure_threshold = 3   # consecutive failures before a provider drops out
 success_threshold = 2   # consecutive successes before it comes back
 cooldown_secs = 30      # how long it stays out before being retried
 
-# Client-facing model names mapped onto whatever you actually run. Useful for
-# applications with a hard-coded model id, and for keeping one stable name in
-# front of a model you swap out.
-[alias]
-"gpt-3.5-turbo" = "qwen2.5:1.5b"
-"gpt-4o-mini" = "qwen2.5:1.5b"
+# A provider that sends `Retry-After` gets to choose its own cooldown, up to
+# this ceiling. It knows about its rate limits; we do not.
+max_cooldown_secs = 300
 
-# --- Upstreams ---------------------------------------------------------------
+[translate]
+# `max_tokens` is optional for OpenAI and mandatory for Anthropic, so an
+# OpenAI-shaped request that omits it needs a value invented here.
+default_max_tokens = 4096
+
+# Sent as `anthropic-version` when the client did not pick one.
+anthropic_version = "2023-06-01"
+
+# --- Providers ---------------------------------------------------------------
 #
-# Each block is one OpenAI-compatible server. The URL includes the version
-# prefix; mini-router rewrites `/v1/...` from the client onto it.
+# Each block is one account at one provider. `protocol` says which dialect it
+# speaks; mini-router translates whenever the client speaks the other one.
+#
+# Keys come from the environment so this file can live in git.
 
 [[upstream]]
-name = "opi-zero3"
-url = "http://127.0.0.1:11434/v1"
-# The single most important knob on a small board. One 1.5B generation will
-# comfortably use a gigabyte; two at once will not fit, and the board will swap
-# itself to a standstill. Requests beyond this queue instead of piling on.
-max_concurrency = 1
-weight = 1
-# Leave `models` unset to discover them from GET {url}/models on every probe.
-# models = ["qwen2.5:1.5b"]
+name = "openai"
+url = "https://api.openai.com/v1"
+protocol = "openai"
+api_key_env = "OPENAI_API_KEY"
+max_concurrency = 8
 
 [[upstream]]
-name = "opi-zero3-b"
-url = "http://10.0.0.12:11434/v1"
-max_concurrency = 1
-weight = 1
+name = "anthropic"
+url = "https://api.anthropic.com/v1"
+protocol = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+max_concurrency = 8
 
-# A bigger machine that happens to be on the same network: give it more weight
-# and more concurrency, and the latency-aware strategies will find it anyway.
+# Anything OpenAI-compatible works, which is nearly everything.
 # [[upstream]]
-# name = "workstation"
-# url = "http://10.0.0.20:8000/v1"
+# name = "groq"
+# url = "https://api.groq.com/openai/v1"
+# protocol = "openai"
+# api_key_env = "GROQ_API_KEY"
 # max_concurrency = 4
-# weight = 4
 
-# A paid endpoint used only when no local board can serve the model.
-# `fallback_only` keeps it out of normal rotation.
 # [[upstream]]
-# name = "cloud"
-# url = "https://api.openai.com/v1"
-# api_key_env = "OPENAI_API_KEY"
-# fallback_only = true
-# max_concurrency = 8
+# name = "openrouter"
+# url = "https://openrouter.ai/api/v1"
+# protocol = "openai"
+# api_key_env = "OPENROUTER_API_KEY"
+# # Some providers want extra headers on every request.
+# headers = { "HTTP-Referer" = "https://my.lan", "X-Title" = "mini-router" }
+
+# A model server on your own network, if you have one. It is just another
+# OpenAI-compatible provider as far as mini-router is concerned.
+# [[upstream]]
+# name = "local"
+# url = "http://10.0.0.20:11434/v1"
+# protocol = "openai"
+# max_concurrency = 1
+
+# --- Pools -------------------------------------------------------------------
+#
+# A pool is one client-facing model name over several provider models. Members
+# are tried in the order written, and anything that fails spills to the next --
+# across providers and across dialects.
+#
+# Ask for "fast" from an OpenAI SDK and you get gpt-4o-mini; if OpenAI is
+# rate-limited, you transparently get Claude Haiku instead, still in the
+# OpenAI response shape your SDK expects.
+
+[pool.fast]
+description = "Cheap and quick, whichever provider is up"
+members = [
+  { upstream = "openai", model = "gpt-4o-mini" },
+  { upstream = "anthropic", model = "claude-haiku-4-5" },
+]
+
+[pool.smart]
+description = "The good models, for when it matters"
+members = [
+  { upstream = "anthropic", model = "claude-sonnet-4-5" },
+  { upstream = "openai", model = "gpt-4o" },
+]
+
+# Pools can override the global strategy: spread evenly to burn quota at the
+# same rate across two accounts, rather than exhausting one then the other.
+# [pool.spread]
+# strategy = "round-robin"
+# members = [
+#   { upstream = "openai", model = "gpt-4o-mini", weight = 1 },
+#   { upstream = "groq", model = "llama-3.3-70b-versatile", weight = 3 },
+# ]
+
+# --- Aliases -----------------------------------------------------------------
+#
+# Client-facing names mapped onto a pool or a model id. Useful for applications
+# with a hard-coded model name that you cannot change.
+
+[alias]
+"gpt-3.5-turbo" = "fast"
+"gpt-4o-mini" = "fast"
+"claude-3-5-haiku-20241022" = "fast"

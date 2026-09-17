@@ -12,6 +12,7 @@ use serde::Serialize;
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::config::UpstreamConfig;
+use crate::protocol::Protocol;
 use crate::util::now_millis;
 
 /// Smoothing factor for the latency EWMA, in percent of the new sample.
@@ -163,6 +164,20 @@ impl Upstream {
         }
     }
 
+    /// Park this provider for at least `until`, regardless of the breaker.
+    /// Used for a `Retry-After`: the provider has told us when to come back,
+    /// and guessing differently only wastes the next request.
+    pub fn park_until(&self, delay: Duration) {
+        let target = now_millis() + delay.as_millis() as u64;
+        self.retry_after_ms.fetch_max(target, Ordering::Relaxed);
+        self.set_health(Health::Down);
+        tracing::warn!(
+            upstream = %self.name,
+            seconds = delay.as_secs(),
+            "provider asked us to back off"
+        );
+    }
+
     /// A request or probe failed. Trips the breaker once the threshold is hit.
     pub fn record_failure(&self, failure_threshold: u32, cooldown: Duration) {
         self.consecutive_successes.store(0, Ordering::Relaxed);
@@ -218,6 +233,7 @@ impl Upstream {
         UpstreamStatus {
             name: self.name.clone(),
             url: self.cfg.url.clone(),
+            protocol: self.cfg.protocol,
             health: self.health(),
             inflight: self.inflight(),
             max_concurrency: self.cfg.max_concurrency,
@@ -237,6 +253,7 @@ impl Upstream {
 pub struct UpstreamStatus {
     pub name: String,
     pub url: String,
+    pub protocol: Protocol,
     pub health: Health,
     pub inflight: usize,
     pub max_concurrency: usize,

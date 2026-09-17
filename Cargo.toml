@@ -3,14 +3,14 @@ name = "mini-router"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "A tiny OpenAI-compatible LLM aggregator and load balancer, small enough for a single-board computer."
+description = "A tiny LLM API aggregator and load balancer: one OpenAI- and Anthropic-compatible endpoint over every provider you use, small enough for a single-board computer."
 authors = ["mini-router contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sudtanj/mini-router"
 homepage = "https://github.com/sudtanj/mini-router"
 documentation = "https://docs.rs/mini-router"
 readme = "README.md"
-keywords = ["llm", "load-balancer", "openai", "proxy", "gateway"]
+keywords = ["llm", "load-balancer", "openai", "anthropic", "gateway"]
 categories = ["web-programming::http-server", "network-programming"]
 exclude = ["/.github", "/deploy", "/docs"]
 
@@ -24,8 +24,9 @@ path = "src/main.rs"
 
 [features]
 default = ["tls"]
-# TLS support for upstreams reached over https://. Disable for a smaller binary
-# when every upstream is a plain-HTTP box on the local network.
+# TLS, which every remote provider API needs. Only turn this off for a
+# deployment where every provider is a plain-HTTP server on your own network;
+# it saves about a megabyte of binary.
 tls = ["dep:hyper-rustls", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]

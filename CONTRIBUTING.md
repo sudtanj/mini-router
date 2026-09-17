@@ -5,52 +5,63 @@ to help is to keep it that way.
 
 ## Ground rules
 
-**The target is a 1 GB single-board computer.** A change that costs memory,
-binary size or dependencies has to buy something worth it. If you are adding a
-dependency, say in the PR why the alternative — writing the twenty lines
-yourself — is worse.
+**Nothing is buffered on the streaming path.** A response body is either
+forwarded untouched or run through an incremental translator. Anything that
+collects a provider response into memory before passing it on will be sent
+back; the bounded exceptions are health probes and non-streamed bodies being
+translated, both capped by config.
 
-**Response bodies are never buffered.** Anything that collects an upstream
-response into memory before forwarding it will be sent back. The one exception
-is health probes, which are bounded.
+**The router runs on a small box.** A change that costs memory, binary size or
+dependencies has to buy something worth it. If you are adding a dependency, say
+in the PR why writing the twenty lines yourself is worse.
 
-**Behaviour changes come with a test.** `tests/routing.rs` runs real HTTP
-against mock upstreams; `tests/support/mod.rs` has the harness, and most new
-cases are a dozen lines.
+**Translation changes need a test in both directions.** A mapping that works
+OpenAI→Anthropic and silently drops something on the way back is worse than no
+mapping. `src/translate/tests.rs` covers the pure functions;
+`tests/routing.rs` covers the whole path over real HTTP.
+
+**Behaviour changes come with a test.** `tests/support/mod.rs` has mock
+providers for both dialects, and most new cases are a dozen lines.
 
 ## Before you open a PR
 
 ```sh
 cargo fmt
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release --no-default-features   # the no-TLS build must keep working
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo test --no-default-features     # the no-TLS build must keep working
 ```
 
-CI runs all of the above plus an `aarch64-unknown-linux-musl` cross-build. It
-will not pass if `cargo fmt --check` fails.
+CI runs all of the above plus MSRV (1.85) and cross-builds for `aarch64` and
+`armv7`. It will not pass if `cargo fmt --check` fails.
 
 ## Good first contributions
 
-- Compatibility fixes for a specific upstream (llama.cpp, vLLM, LocalAI,
-  llamafile, text-generation-webui). If your server does something surprising,
-  a mock reproducing it is a genuinely useful PR on its own.
-- Token accounting from non-streamed responses.
+- **A provider that behaves differently.** If Groq, Together, DeepSeek,
+  OpenRouter, Bedrock or Vertex does something surprising, a mock reproducing it
+  in `tests/support/mod.rs` is a genuinely useful PR on its own.
+- **Translation gaps.** Anything either API grows that we drop on the floor:
+  structured outputs, prompt caching hints, parallel tool-call flags, audio
+  content blocks.
+- Cost-aware routing (per-member price, prefer the cheapest healthy member).
+- Token accounting from streamed `usage` frames.
 - Config hot-reload on `SIGHUP`.
-- Per-request model fallback chains (`model: ["a", "b"]`).
 - Real numbers from real hardware for the footprint table in the README.
 
 ## Reporting a bug
 
 Include the output of `GET /admin/upstreams`, the relevant part of your config
-with secrets removed, and what the upstream is (llama.cpp? Ollama? which
-version?). Run with `MINI_ROUTER_LOG=debug` if you can — routing decisions and
-probe failures are logged at that level.
+with secrets removed, and which providers are involved. If it is a translation
+problem, the request you sent and the response you got back are the two things
+that matter most. Run with `MINI_ROUTER_LOG=debug` for routing decisions and
+probe failures.
 
 ## Security
 
 Please report anything with a security impact privately through GitHub's
-"Report a vulnerability" rather than in a public issue.
+"Report a vulnerability" rather than in a public issue. Note that mini-router
+holds provider API keys, so anything touching credential handling, the auth
+path, or what gets written to logs counts.
 
 ## License
 

@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test / ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.85"]  # 1.85 is the MSRV; see rust-version in Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        if: matrix.rust == 'stable'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        # --locked on the MSRV job: the minimum supported version depends on
+        # the pinned dependency set, not on whatever resolves today.
+        run: cargo test --all-features --locked
+
+      - name: Build without TLS
+        run: cargo build --no-default-features
+
+  # The no-TLS build is what a LAN-only deployment ships, so it has to keep
+  # compiling and keep passing its tests.
+  minimal-build:
+    name: no-default-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --no-default-features
+      - name: Release size
+        run: |
+          cargo build --release --no-default-features
+          ls -l target/release/mini-router
+          echo "no-tls release binary: $(stat -c%s target/release/mini-router) bytes" >> "$GITHUB_STEP_SUMMARY"
+
+  cross:
+    name: cross-build / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Orange Pi Zero 3, Raspberry Pi 4/5, most 64-bit boards.
+          - target: aarch64-unknown-linux-gnu
+            packages: gcc-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+          # 32-bit ARM boards.
+          - target: armv7-unknown-linux-gnueabihf
+            packages: gcc-arm-linux-gnueabihf
+            cc: arm-linux-gnueabihf-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.packages }}
+      - name: Build
+        env:
+          CC: ${{ matrix.cc }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Report size
+        run: |
+          size=$(stat -c%s "target/${{ matrix.target }}/release/mini-router")
+          echo "${{ matrix.target }} release binary: $size bytes" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mini-router-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/mini-router
+          if-no-files-found: error
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

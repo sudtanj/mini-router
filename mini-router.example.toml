@@ -1,0 +1,118 @@
+# mini-router configuration
+#
+# Copy to mini-router.toml and edit. Every value below is optional except the
+# [[upstream]] blocks; the defaults are chosen for a 1 GB single-board computer.
+# Validate a file without starting the server:
+#
+#     mini-router --config mini-router.toml --check
+
+[server]
+listen = "0.0.0.0:8080"
+
+# Tokio worker threads. Keep this small: on a 4-core board the model server
+# wants the cores far more than the proxy does. 0 means one per core.
+worker_threads = 2
+
+# Largest request body accepted from a client (8 MiB). Mostly a guard against a
+# runaway client pinning memory on a board that has very little of it.
+max_body_bytes = 8388608
+
+# How long to wait for an upstream to send response *headers*. This is not a
+# limit on generation time: once the first byte arrives, a stream may run for
+# as long as it likes.
+upstream_header_timeout_secs = 120
+
+# How long a request may wait for a free slot when every upstream that serves
+# the model is busy. Exceeding it returns 429 rather than queueing forever.
+queue_timeout_secs = 60
+
+# Keep-alive for pooled upstream connections.
+pool_idle_timeout_secs = 90
+
+# error | warn | info | debug | trace  (override with MINI_ROUTER_LOG)
+log_level = "info"
+
+[server.auth]
+# Keys clients must present as `Authorization: Bearer <key>`.
+# Leave require_auth = false on a trusted home network; turn it on the moment
+# the port is reachable from anywhere else.
+require_auth = false
+api_keys = []
+# Read additional client keys from the environment, so secrets stay out of the
+# config file:
+# api_key_envs = ["MINI_ROUTER_CLIENT_KEY"]
+
+[balance]
+# round-robin      plain rotation
+# least-conn       fewest requests in flight
+# weighted         rotation biased by each upstream's `weight`
+# p2c-latency      power of two choices, compared on time-to-first-byte
+# first-available  always the first healthy upstream (primary + spares)
+strategy = "p2c-latency"
+
+# Extra upstreams to try when an attempt fails. 2 means three attempts total.
+retries = 2
+
+# Upstream statuses that trigger a retry elsewhere instead of being passed
+# through to the client.
+retry_on_status = [408, 429, 500, 502, 503, 504]
+
+[health]
+# Seconds between probes. 0 disables active probing entirely, leaving health to
+# be inferred from live traffic.
+interval_secs = 15
+timeout_secs = 5
+
+# Probe path, appended to each upstream's base URL. The response doubles as
+# model discovery.
+path = "/models"
+
+failure_threshold = 3   # consecutive failures before an upstream drops out
+success_threshold = 2   # consecutive successes before it comes back
+cooldown_secs = 30      # how long it stays out before being retried
+
+# Client-facing model names mapped onto whatever you actually run. Useful for
+# applications with a hard-coded model id, and for keeping one stable name in
+# front of a model you swap out.
+[alias]
+"gpt-3.5-turbo" = "qwen2.5:1.5b"
+"gpt-4o-mini" = "qwen2.5:1.5b"
+
+# --- Upstreams ---------------------------------------------------------------
+#
+# Each block is one OpenAI-compatible server. The URL includes the version
+# prefix; mini-router rewrites `/v1/...` from the client onto it.
+
+[[upstream]]
+name = "opi-zero3"
+url = "http://127.0.0.1:11434/v1"
+# The single most important knob on a small board. One 1.5B generation will
+# comfortably use a gigabyte; two at once will not fit, and the board will swap
+# itself to a standstill. Requests beyond this queue instead of piling on.
+max_concurrency = 1
+weight = 1
+# Leave `models` unset to discover them from GET {url}/models on every probe.
+# models = ["qwen2.5:1.5b"]
+
+[[upstream]]
+name = "opi-zero3-b"
+url = "http://10.0.0.12:11434/v1"
+max_concurrency = 1
+weight = 1
+
+# A bigger machine that happens to be on the same network: give it more weight
+# and more concurrency, and the latency-aware strategies will find it anyway.
+# [[upstream]]
+# name = "workstation"
+# url = "http://10.0.0.20:8000/v1"
+# max_concurrency = 4
+# weight = 4
+
+# A paid endpoint used only when no local board can serve the model.
+# `fallback_only` keeps it out of normal rotation.
+# [[upstream]]
+# name = "cloud"
+# url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
+# fallback_only = true
+# max_concurrency = 8

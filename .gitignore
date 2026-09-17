@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local configuration and secrets
+mini-router.toml
+.env

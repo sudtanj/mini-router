@@ -1,0 +1,17 @@
+# Cross-compilation for single-board computers. These only take effect when you
+# actually build for one of these targets, and only if the toolchain is
+# installed:
+#
+#   rustup target add aarch64-unknown-linux-gnu
+#   sudo apt install gcc-aarch64-linux-gnu      # Debian/Ubuntu
+#
+# Orange Pi Zero 3, Raspberry Pi 3/4/5 (64-bit), most modern boards:
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-gnu-gcc"
+
+# 32-bit ARM boards (Orange Pi Zero, Raspberry Pi Zero 2 W on a 32-bit OS):
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"

@@ -1,0 +1,65 @@
+[package]
+name = "mini-router"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A tiny OpenAI-compatible LLM aggregator and load balancer, small enough for a single-board computer."
+authors = ["mini-router contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sudtanj/mini-router"
+homepage = "https://github.com/sudtanj/mini-router"
+documentation = "https://docs.rs/mini-router"
+readme = "README.md"
+keywords = ["llm", "load-balancer", "openai", "proxy", "gateway"]
+categories = ["web-programming::http-server", "network-programming"]
+exclude = ["/.github", "/deploy", "/docs"]
+
+[lib]
+name = "mini_router"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mini-router"
+path = "src/main.rs"
+
+[features]
+default = ["tls"]
+# TLS support for upstreams reached over https://. Disable for a smaller binary
+# when every upstream is a plain-HTTP box on the local network.
+tls = ["dep:hyper-rustls", "dep:rustls", "dep:webpki-roots"]
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query", "matched-path", "original-uri"] }
+bytes = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio", "server"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "signal", "macros", "sync"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
+
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# Tuned for small single-board computers: the binary is what ships, and every
+# kilobyte of resident text competes with the model server for page cache.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false
+
+[profile.dev]
+opt-level = 0
+debug = 1

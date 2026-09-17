@@ -7,23 +7,21 @@
 //! authenticated.
 
 use axum::http::{header, HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fmt;
 
 /// Default value for the `anthropic-version` header, required by the
 /// Anthropic Messages API.
 pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     /// OpenAI Chat Completions. Also the shape spoken by Groq, Together,
     /// OpenRouter, DeepSeek, vLLM, llama.cpp, Ollama and most of the rest.
     #[default]
-    #[serde(alias = "openai-compatible", alias = "oai")]
     Openai,
     /// Anthropic Messages.
-    #[serde(alias = "claude")]
     Anthropic,
 }
 
@@ -310,15 +308,15 @@ mod tests {
     }
 
     #[test]
-    fn protocol_aliases_parse() {
-        for (text, expected) in [
-            ("\"openai\"", Protocol::Openai),
-            ("\"openai-compatible\"", Protocol::Openai),
-            ("\"anthropic\"", Protocol::Anthropic),
-            ("\"claude\"", Protocol::Anthropic),
-        ] {
-            let p: Protocol = serde_json::from_str(text).unwrap();
-            assert_eq!(p, expected, "{text}");
-        }
+    fn protocol_renders_lowercase_for_the_admin_view() {
+        assert_eq!(
+            serde_json::to_string(&Protocol::Openai).unwrap(),
+            "\"openai\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Protocol::Anthropic).unwrap(),
+            "\"anthropic\""
+        );
+        assert_eq!(Protocol::Openai.to_string(), "openai");
     }
 }

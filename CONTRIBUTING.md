@@ -11,6 +11,11 @@ collects a provider response into memory before passing it on will be sent
 back; the bounded exceptions are health probes and non-streamed bodies being
 translated, both capped by config.
 
+**Configuration is environment variables only.** There is no config file and
+no plans for one: one source of truth, and a container image that needs nothing
+mounted into it. New settings go in `src/env.rs` with a test, and in the
+`ENVIRONMENT` section of `--help`.
+
 **The router runs on a small box.** A change that costs memory, binary size or
 dependencies has to buy something worth it. If you are adding a dependency, say
 in the PR why writing the twenty lines yourself is worse.

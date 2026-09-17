@@ -1,82 +1,62 @@
-//! Configuration loading and validation.
+//! The configuration model and its validation.
 //!
-//! The whole configuration is a single TOML file. Anything that is not set
-//! falls back to a default that works for a router sitting in front of remote
-//! provider APIs.
+//! There is no configuration file. Every setting comes from the environment
+//! (see [`crate::env`]), which is what makes a `docker compose` file with an
+//! `environment:` block a complete deployment. This module holds the shape
+//! those variables are parsed into, the defaults for everything left unset,
+//! and the rules that reject a configuration that would fail confusingly at
+//! runtime.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
 
 use crate::protocol::{Protocol, DEFAULT_ANTHROPIC_VERSION};
 
 /// Top level configuration document.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
-    #[serde(default)]
     pub server: ServerConfig,
-    #[serde(default)]
     pub balance: BalanceConfig,
-    #[serde(default)]
     pub health: HealthConfig,
-    #[serde(default)]
     pub translate: TranslateConfig,
     /// Client-facing model name -> upstream model name.
-    #[serde(default)]
     pub alias: BTreeMap<String, String>,
     /// Named groups of provider models that serve one client-facing name.
-    #[serde(default, rename = "pool")]
     pub pools: BTreeMap<String, PoolConfig>,
-    #[serde(default, rename = "upstream")]
     pub upstreams: Vec<UpstreamConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Address to bind the HTTP listener to.
-    #[serde(default = "default_listen")]
     pub listen: SocketAddr,
     /// Tokio worker threads. 0 means "one per core", which is rarely what you
     /// want on a small board whose job is mostly waiting on sockets.
-    #[serde(default = "default_worker_threads")]
     pub worker_threads: usize,
     /// Largest request body accepted from a client, in bytes.
-    #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
     /// Largest non-streamed response body the router will translate. Only
     /// applies when the client and the provider speak different dialects;
     /// same-dialect responses are streamed through untouched at any size.
-    #[serde(default = "default_max_translate_bytes")]
     pub max_translate_bytes: usize,
     /// How long to wait for a provider to return response *headers*. Body
     /// streaming is not bounded by this: a long generation is not a timeout.
-    #[serde(default = "default_upstream_header_timeout")]
     pub upstream_header_timeout_secs: u64,
     /// How long a request may wait for a free slot when every candidate is
     /// already at its concurrency limit.
-    #[serde(default = "default_queue_timeout")]
     pub queue_timeout_secs: u64,
     /// Idle keep-alive timeout for pooled provider connections.
-    #[serde(default = "default_pool_idle_timeout")]
     pub pool_idle_timeout_secs: u64,
     /// Log level: error, warn, info, debug, trace.
-    #[serde(default = "default_log_level")]
     pub log_level: String,
     /// Serve `GET /admin/upstreams`. It is a JSON endpoint, not a dashboard --
     /// there is no UI anywhere in mini-router -- but turning it off removes one
     /// more thing listening.
-    #[serde(default = "default_true")]
     pub admin: bool,
     /// Serve `GET /metrics` (Prometheus text).
-    #[serde(default = "default_true")]
     pub metrics: bool,
-    #[serde(default)]
     pub auth: AuthConfig,
 }
 
@@ -107,31 +87,24 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthConfig {
     /// Keys clients may present, as `Authorization: Bearer <key>` or
     /// `x-api-key: <key>` -- whichever dialect their SDK uses.
-    #[serde(default)]
     pub api_keys: Vec<String>,
     /// Environment variables to read additional client keys from.
-    #[serde(default)]
     pub api_key_envs: Vec<String>,
     /// Require a valid key on the API endpoints.
-    #[serde(default)]
     pub require_auth: bool,
 }
 
 /// Knobs for cross-protocol translation.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct TranslateConfig {
     /// `max_tokens` is optional for OpenAI and mandatory for Anthropic, so an
     /// OpenAI-shaped request that omits it needs a value invented here.
-    #[serde(default = "default_max_tokens")]
     pub default_max_tokens: u64,
     /// Value sent as `anthropic-version` when the client did not pick one.
-    #[serde(default = "default_anthropic_version")]
     pub anthropic_version: String,
 }
 
@@ -145,8 +118,7 @@ impl Default for TranslateConfig {
 }
 
 /// How the candidates for a request are ordered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
     /// Declaration order, every time. The first healthy candidate serves the
     /// request and anything that fails spills to the next one. This is the
@@ -177,8 +149,7 @@ impl fmt::Display for Strategy {
 }
 
 /// What counts as a reason to try the next candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Spillover {
     /// Anything that is not a success: a refused connection, a timeout, a
     /// rate limit, a 5xx, an expired key, a model the provider does not have.
@@ -189,19 +160,14 @@ pub enum Spillover {
     StatusList,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct BalanceConfig {
-    #[serde(default)]
     pub strategy: Strategy,
     /// Cap on attempts per request. 0 means "try every candidate", which is
     /// what makes spillover actually exhaust the pool.
-    #[serde(default)]
     pub max_attempts: usize,
-    #[serde(default)]
     pub spillover: Spillover,
-    /// Consulted only when `spillover = "status-list"`.
-    #[serde(default = "default_retry_statuses")]
+    /// Consulted only when spillover is `status-list`.
     pub retry_on_status: Vec<u16>,
 }
 
@@ -226,32 +192,24 @@ impl BalanceConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct HealthConfig {
     /// Seconds between probes. 0 disables active probing; providers are then
     /// only judged by live traffic.
-    #[serde(default = "default_health_interval")]
     pub interval_secs: u64,
-    #[serde(default = "default_health_timeout")]
     pub timeout_secs: u64,
     /// Probe path, appended to the provider's base URL.
-    #[serde(default = "default_health_path")]
     pub path: String,
     /// Consecutive failures before a provider is taken out of rotation.
-    #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
     /// Consecutive successes before a recovering provider is used again.
-    #[serde(default = "default_success_threshold")]
     pub success_threshold: u32,
     /// How long a provider stays out of rotation once it trips. A
     /// `Retry-After` header from the provider overrides this when it is
     /// longer, because the provider knows better than we do.
-    #[serde(default = "default_cooldown")]
     pub cooldown_secs: u64,
     /// Upper bound on a `Retry-After` the router will honour, so a provider
     /// cannot park itself for an hour.
-    #[serde(default = "default_max_cooldown")]
     pub max_cooldown_secs: u64,
 }
 
@@ -285,66 +243,53 @@ impl HealthConfig {
 }
 
 /// A named group of provider models that one client-facing name resolves to.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// Built from `MINI_ROUTER_POOL_<NAME>`.
+#[derive(Debug, Clone, Default)]
 pub struct PoolConfig {
     /// Members in priority order.
     pub members: Vec<PoolMember>,
-    /// Overrides `balance.strategy` for this pool.
-    #[serde(default)]
+    /// Overrides the global strategy for this pool.
     pub strategy: Option<Strategy>,
     /// Shown in the model catalogue.
-    #[serde(default)]
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct PoolMember {
-    /// Name of the `[[upstream]]` this member lives on.
+    /// Name of the provider this member lives on.
     pub upstream: String,
     /// The provider-side model id.
     pub model: String,
     /// Relative share under the `weighted` strategy.
-    #[serde(default = "default_weight")]
     pub weight: u32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     /// Stable identifier, used in logs, metrics and the admin API.
     pub name: String,
     /// Base URL including any version prefix, e.g. `https://api.openai.com/v1`.
     pub url: String,
     /// Which dialect this provider speaks.
-    #[serde(default)]
     pub protocol: Protocol,
     /// Bearer token or API key sent to this provider.
-    #[serde(default)]
     pub api_key: Option<String>,
     /// Environment variable holding the key. Takes precedence over `api_key`,
     /// so secrets need not live in the config file.
-    #[serde(default)]
     pub api_key_env: Option<String>,
     /// Relative share of traffic under the `weighted` strategy.
-    #[serde(default = "default_weight")]
     pub weight: u32,
     /// Requests this provider may process at once. For a remote API this is
     /// about staying inside a rate limit, not about memory.
-    #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
     /// Models this provider serves. Empty means "discover from
     /// `GET {url}/models` and refresh on every health probe".
-    #[serde(default)]
     pub models: Vec<String>,
     /// Never route here unless the client asked for a model only this provider
     /// serves. Pools express priority through member order instead.
-    #[serde(default)]
     pub fallback_only: bool,
     /// Extra headers sent with every request, for providers that want one
     /// (`HTTP-Referer` and `X-Title` for OpenRouter, say).
-    #[serde(default)]
     pub headers: BTreeMap<String, String>,
 }
 
@@ -366,22 +311,9 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
-    /// Parse a configuration document and validate it.
-    pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let cfg: Config = toml::from_str(text).map_err(|e| ConfigError(e.to_string()))?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    /// Build configuration from the environment alone.
+    /// Build and validate the configuration from the process environment.
     pub fn from_env() -> Result<Self, ConfigError> {
-        crate::env::apply(Config::default(), &crate::env::vars()).map(|r| r.config)
-    }
-
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
-        Self::from_toml(&text)
+        crate::env::load(&crate::env::vars()).map(|r| r.config)
     }
 
     /// Reject configurations that would fail confusingly at runtime.
@@ -390,7 +322,8 @@ impl Config {
             return Err(ConfigError(
                 "no providers configured: mini-router has nothing to route to.\n\
                  Set a well-known key (OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, ...),\n\
-                 or MINI_ROUTER_PROVIDER_<NAME>_URL, or add an [[upstream]] block to a config file."
+                 or define one with MINI_ROUTER_PROVIDER_<NAME>_URL.\n\
+                 Run `mini-router --help` for the full list."
                     .into(),
             ));
         }
@@ -617,9 +550,6 @@ fn default_cooldown() -> u64 {
 }
 fn default_max_cooldown() -> u64 {
     300
-}
-fn default_true() -> bool {
-    true
 }
 fn default_weight() -> u32 {
     1

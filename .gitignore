@@ -2,7 +2,7 @@
 **/*.rs.bk
 *.pdb
 
-# Local configuration and secrets
-mini-router.toml
+# Local secrets. There is no config file to ignore: mini-router is configured
+# entirely from the environment.
 .env
 .env.local

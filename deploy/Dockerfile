@@ -7,9 +7,8 @@
 #     -e MINI_ROUTER_POOL_FAST=openai:gpt-4o-mini,anthropic:claude-haiku-4-5 \
 #     mini-router
 #
-# No config file is needed: everything is environment variables. Mount one at
-# /etc/mini-router/mini-router.toml if you would rather keep a base config in
-# the image; the environment still overrides it.
+# There is no config file. Everything is environment variables, so an image
+# plus a compose block is a whole deployment.
 #
 # Building for a board from an amd64 host:
 #   docker buildx build --platform linux/arm64 -f deploy/Dockerfile -t mini-router .

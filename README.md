@@ -46,10 +46,10 @@ translator** (the expensive path).
 
 | | |
 |---|---|
-| Binary, stripped | **2.4 MB** (1.4 MB with `--no-default-features`, no TLS) |
+| Binary, stripped | **2.2 MB** (1.3 MB with `--no-default-features`, no TLS) |
 | Idle RSS | **4.8 MB** |
 | RSS during 48 concurrent translated streams | **4.8 MB** — unchanged |
-| Dependencies | 93 crates |
+| Dependencies | 95 crates |
 
 Memory is flat under load because nothing is buffered. A same-dialect response
 is forwarded frame by frame without being read; a translated one goes through
@@ -58,8 +58,8 @@ costs the same as a one-line one.
 
 ## Quick start
 
-Everything is environment variables. There is no config file to write unless
-you want one.
+Everything is environment variables. There is no configuration file at all —
+nothing to write, mount, template or keep in sync with the image.
 
 ```yaml
 # docker-compose.yml
@@ -125,7 +125,7 @@ what is missing:
 
 ```
 $ mini-router --check
-configuration ok (environment only): 2 provider(s), 1 pool(s), strategy priority, spillover any-error
+configuration ok: 2 provider(s), 1 pool(s), strategy priority, spillover any-error
   provider  anthropic      anthropic  [auto] https://api.anthropic.com/v1
   provider  openai         openai     [auto] https://api.openai.com/v1
   pool      fast           openai:gpt-4o-mini  ->  anthropic:claude-haiku-4-5
@@ -143,6 +143,16 @@ Run `mini-router --help` for the list
 ```
 
 ## Configuration
+
+Every setting is an environment variable. `mini-router --help` lists all of
+them, and `--check` shows what they resolved to.
+
+Two rules make that safe to lean on:
+
+- **A variable mini-router does not recognise is a startup error**, naming the
+  variable. A typo costs a failed start, not a week of wondering why a setting
+  had no effect.
+- **A bad value names the variable, the value and what was expected.**
 
 ### Providers
 
@@ -231,32 +241,15 @@ Health and translation: `MINI_ROUTER_HEALTH_INTERVAL_SECS`,
 
 `mini-router --help` lists all of them.
 
-### A config file, if you prefer one
-
-A TOML file still works, and the environment overrides it — so an image can
-ship a base config and a deployment can adjust it. See
-[`mini-router.example.toml`](mini-router.example.toml), which documents every
-setting inline.
-
-```sh
-mini-router --config mini-router.toml
-```
-
-Without `-c`, `./mini-router.toml` or `$MINI_ROUTER_CONFIG` is used if it
-exists; otherwise the environment is the whole configuration.
 
 ## Pools
 
 A pool is one client-facing name over several provider models, tried in the
 order you wrote them:
 
-```toml
-[pool.smart]
-description = "The good models, for when it matters"
-members = [
-  { upstream = "anthropic", model = "claude-sonnet-4-5" },
-  { upstream = "openai",    model = "gpt-4o" },
-]
+```yaml
+MINI_ROUTER_POOL_SMART: anthropic:claude-sonnet-4-5,openai:gpt-4o
+MINI_ROUTER_POOL_SMART_DESCRIPTION: The good models, for when it matters
 ```
 
 The first member serves. If it fails — for **any** reason — the second one
@@ -272,13 +265,10 @@ what actually happened:
 Pools can override the global strategy — useful to burn two accounts' quota
 evenly rather than exhausting one and then the other:
 
-```toml
-[pool.spread]
-strategy = "round-robin"
-members = [
-  { upstream = "openai", model = "gpt-4o-mini", weight = 1 },
-  { upstream = "groq",   model = "llama-3.3-70b-versatile", weight = 3 },
-]
+```yaml
+MINI_ROUTER_POOL_SPREAD: openai:gpt-4o-mini,groq:llama-3.3-70b-versatile
+MINI_ROUTER_POOL_SPREAD_STRATEGY: round-robin
+MINI_ROUTER_POOL_SPREAD_WEIGHTS: "1,3"
 ```
 
 | Strategy | Use it when |
@@ -294,8 +284,8 @@ first is the spillover path, in order.
 
 ## Spillover
 
-The default is `spillover = "any-error"`: a candidate is used up by anything
-that is not a 2xx, plus every transport failure.
+The default is `MINI_ROUTER_SPILLOVER=any-error`: a candidate is used up by
+anything that is not a 2xx, plus every transport failure.
 
 ```
 connection refused ─┐
@@ -315,10 +305,9 @@ long (up to `health.max_cooldown_secs`) instead of being asked again.
 
 Narrow it if you would rather a genuine `400` reach the client immediately:
 
-```toml
-[balance]
-spillover = "status-list"
-retry_on_status = [429, 500, 502, 503, 529]
+```yaml
+MINI_ROUTER_SPILLOVER: status-list
+MINI_ROUTER_RETRY_ON_STATUS: 429,500,502,503,529
 ```
 
 ## Protocol translation
@@ -479,6 +468,9 @@ low `spilled_out_total` is the system working as intended.
 
 ## Design notes
 
+- **There is no configuration file.** One source of truth, one format, and a
+  container image that needs nothing mounted into it. Dropping the TOML parser
+  also took 233 KB and six crates out of the build.
 - **Nothing is buffered on the streaming path.** Same-dialect responses are a
   thin wrapper over the provider's body. Translated ones run each frame through
   an SSE state machine that holds only a partial event.
@@ -498,7 +490,7 @@ low `spilled_out_total` is the system working as intended.
 ## Development
 
 ```sh
-cargo test                                    # 164 tests
+cargo test                                    # 159 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo test --no-default-features              # the no-TLS build

@@ -1,11 +1,18 @@
 //! Configuration from the environment.
 //!
-//! The deployment this is written for is a `docker compose up` with a block of
-//! `environment:` entries and no config file at all. Anything expressible in
-//! the TOML file is expressible here, and the environment always wins, so an
-//! image can ship a sensible base config and a deployment can adjust it.
+//! This is the only way mini-router is configured. The deployment it is written
+//! for is a `docker compose up` with a block of `environment:` entries and
+//! nothing else -- no file to write, mount, template or keep in sync with the
+//! image.
 //!
-//! Every function here works over an explicit list of variables rather than
+//! Two rules make that safe to rely on:
+//!
+//! - A variable mini-router does not recognise is a startup error naming the
+//!   variable, not a silent default. A typo costs you a failed start, not a
+//!   week of wondering why a setting had no effect.
+//! - A bad value names the variable, the value and what was expected.
+//!
+//! Everything here works over an explicit list of variables rather than
 //! reading the process environment, which keeps the parsing testable and keeps
 //! tests from racing each other over a shared global.
 
@@ -102,26 +109,26 @@ const PROVIDER_FIELDS: &[&str] = &[
 /// Per-pool setting suffixes. A bare `MINI_ROUTER_POOL_<NAME>` is the members.
 const POOL_FIELDS: &[&str] = &["_DESCRIPTION", "_STRATEGY", "_WEIGHTS"];
 
-/// Where a provider's definition came from, for `--check`.
+/// How a provider came to be configured, for `--check`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
-    File,
-    Environment,
+    /// Spelled out with `MINI_ROUTER_PROVIDER_<NAME>_*`.
+    Declared,
+    /// Recognised from a well-known key such as `OPENAI_API_KEY`.
     Autodetected,
 }
 
 impl std::fmt::Display for Source {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Source::File => "file",
-            Source::Environment => "env",
+            Source::Declared => "set",
             Source::Autodetected => "auto",
         })
     }
 }
 
-/// The result of resolving configuration, with a note of where each provider
-/// came from so `--check` can show it.
+/// A resolved configuration, with a note of how each provider came to be
+/// configured so `--check` can show it.
 #[derive(Debug)]
 pub struct Resolved {
     pub config: Config,
@@ -137,17 +144,10 @@ pub fn vars() -> Vec<(String, String)> {
     std::env::vars().collect()
 }
 
-/// Overlay environment settings onto `config`, then autodetect providers if
-/// none were configured anywhere.
-///
-/// `base` is whatever the config file gave us, or a default `Config` when
-/// there was no file.
-pub fn apply(mut config: Config, vars: &[(String, String)]) -> Result<Resolved, ConfigError> {
-    let mut sources: BTreeMap<String, Source> = config
-        .upstreams
-        .iter()
-        .map(|u| (u.name.clone(), Source::File))
-        .collect();
+/// Build the whole configuration from a set of environment variables.
+pub fn load(vars: &[(String, String)]) -> Result<Resolved, ConfigError> {
+    let mut config = Config::default();
+    let mut sources: BTreeMap<String, Source> = BTreeMap::new();
 
     let lookup: BTreeMap<&str, &str> = vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
@@ -211,7 +211,7 @@ pub fn apply(mut config: Config, vars: &[(String, String)]) -> Result<Resolved, 
 
     for (name, fields) in providers {
         apply_provider(&mut config, &name, &fields, &lookup)?;
-        sources.insert(name, Source::Environment);
+        sources.insert(name, Source::Declared);
     }
 
     let autodetect = match lookup.get("MINI_ROUTER_AUTODETECT") {

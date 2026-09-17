@@ -39,7 +39,6 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "signal", "macros", "sync"] }
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
 

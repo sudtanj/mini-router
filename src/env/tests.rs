@@ -9,7 +9,7 @@ fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 fn resolve(pairs: &[(&str, &str)]) -> Resolved {
-    apply(Config::default(), &vars(pairs)).unwrap_or_else(|e| panic!("should resolve: {e}"))
+    load(&vars(pairs)).unwrap_or_else(|e| panic!("should resolve: {e}"))
 }
 
 /// Providers spelled out in full. Tests that merely need a provider to exist
@@ -26,7 +26,7 @@ const ANTHROPIC_URL: (&str, &str) = (
 const ANTHROPIC_PROTO: (&str, &str) = ("MINI_ROUTER_PROVIDER_ANTHROPIC_PROTOCOL", "anthropic");
 
 fn resolve_err(pairs: &[(&str, &str)]) -> String {
-    apply(Config::default(), &vars(pairs))
+    load(&vars(pairs))
         .map(|_| String::new())
         .unwrap_err()
         .to_string()
@@ -78,10 +78,7 @@ fn every_well_known_provider_is_detected() {
 #[test]
 fn an_empty_key_is_treated_as_unset() {
     // Compose writes an empty string for a variable that is not in the .env.
-    let err = apply(Config::default(), &vars(&[("OPENAI_API_KEY", "")]))
-        .map(|_| String::new())
-        .unwrap_err()
-        .to_string();
+    let err = resolve_err(&[("OPENAI_API_KEY", "")]);
     assert!(err.contains("no providers configured"), "{err}");
 }
 
@@ -114,13 +111,10 @@ fn autodetection_stands_down_once_a_provider_is_configured() {
     assert_eq!(names, ["local", "openai"]);
 
     // Or explicitly refuse it.
-    let off = apply(
-        Config::default(),
-        &vars(&[
-            ("OPENAI_API_KEY", "sk-oai"),
-            ("MINI_ROUTER_AUTODETECT", "off"),
-        ]),
-    );
+    let off = load(&vars(&[
+        ("OPENAI_API_KEY", "sk-oai"),
+        ("MINI_ROUTER_AUTODETECT", "off"),
+    ]));
     assert!(
         off.is_err(),
         "autodetect off with no explicit provider has nothing to route to"
@@ -178,7 +172,7 @@ fn a_provider_can_be_defined_entirely_by_environment() {
     assert!(!up.fallback_only);
     assert_eq!(up.headers["x-title"], "mini-router");
     assert_eq!(up.headers["http-referer"], "https://my.lan");
-    assert_eq!(r.sources["mybox"], Source::Environment);
+    assert_eq!(r.sources["mybox"], Source::Declared);
 }
 
 #[test]
@@ -494,91 +488,6 @@ fn other_variables_in_the_environment_are_ignored() {
         OPENAI,
     ]);
     assert_eq!(r.config.upstreams.len(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// File plus environment
-// ---------------------------------------------------------------------------
-
-#[test]
-fn the_environment_overrides_the_file() {
-    // The image ships a base config; the deployment adjusts it.
-    let base = Config::from_toml(
-        r#"
-        [server]
-        listen = "0.0.0.0:8080"
-        [[upstream]]
-        name = "openai"
-        url = "http://openai.invalid/v1"
-        max_concurrency = 8
-        "#,
-    )
-    .unwrap();
-
-    let r = apply(
-        base,
-        &vars(&[
-            ("MINI_ROUTER_LISTEN", "0.0.0.0:9000"),
-            ("MINI_ROUTER_PROVIDER_OPENAI_MAX_CONCURRENCY", "32"),
-            ("MINI_ROUTER_PROVIDER_OPENAI_API_KEY", "sk-from-env"),
-        ]),
-    )
-    .unwrap();
-
-    assert_eq!(r.config.server.listen.to_string(), "0.0.0.0:9000");
-    assert_eq!(
-        r.config.upstreams.len(),
-        1,
-        "the provider should be edited, not duplicated"
-    );
-    assert_eq!(r.config.upstreams[0].max_concurrency, 32);
-    assert_eq!(
-        r.config.upstreams[0].api_key.as_deref(),
-        Some("sk-from-env")
-    );
-    // Untouched fields survive.
-    assert_eq!(r.config.upstreams[0].url, "http://openai.invalid/v1");
-    assert_eq!(r.sources["openai"], Source::Environment);
-}
-
-// Well-known providers are all https, so this needs a TLS build.
-#[cfg(feature = "tls")]
-#[test]
-fn a_file_provider_is_not_shadowed_by_autodetection() {
-    let base = Config::from_toml(
-        r#"
-        [[upstream]]
-        name = "openai"
-        url = "https://my-proxy.internal/v1"
-        "#,
-    )
-    .unwrap();
-    let r = apply(base, &vars(&[("OPENAI_API_KEY", "sk-oai")])).unwrap();
-    assert_eq!(r.config.upstreams.len(), 1);
-    assert_eq!(r.config.upstreams[0].url, "https://my-proxy.internal/v1");
-    assert_eq!(r.sources["openai"], Source::File);
-}
-
-#[test]
-fn a_pool_from_the_environment_can_extend_a_file() {
-    let base = Config::from_toml(
-        r#"
-        [[upstream]]
-        name = "openai"
-        url = "http://openai.invalid/v1"
-        [pool.fast]
-        members = [{ upstream = "openai", model = "gpt-4o-mini" }]
-        "#,
-    )
-    .unwrap();
-    let r = apply(
-        base,
-        &vars(&[("MINI_ROUTER_POOL_FAST_STRATEGY", "round-robin")]),
-    )
-    .unwrap();
-    // Members kept, strategy added.
-    assert_eq!(r.config.pools["fast"].members.len(), 1);
-    assert_eq!(r.config.pools["fast"].strategy, Some(Strategy::RoundRobin));
 }
 
 // ---------------------------------------------------------------------------

@@ -105,27 +105,31 @@ impl Mock {
             .ok()
             .map(str::to_owned)
     }
-    /// The config block that points the router at this provider.
-    pub fn upstream_toml(&self) -> String {
+    /// The key this provider expects to be given.
+    pub fn api_key(&self) -> String {
+        format!("sk-{}-secret", self.name)
+    }
+
+    /// `MINI_ROUTER_PROVIDER_<NAME>_` for this provider.
+    fn var_prefix(&self) -> String {
         format!(
-            r#"
-            [[upstream]]
-            name = "{}"
-            url = "{}"
-            protocol = "{}"
-            api_key = "sk-{}-secret"
-            models = [{}]
-            "#,
-            self.name,
-            self.base_url(),
-            self.protocol,
-            self.name,
-            self.models
-                .iter()
-                .map(|m| format!("{m:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "MINI_ROUTER_PROVIDER_{}_",
+            self.name.to_uppercase().replace('-', "_")
         )
+    }
+
+    /// The environment variables that point the router at this provider.
+    pub fn env_vars(&self) -> Vec<(String, String)> {
+        let p = self.var_prefix();
+        let mut out = vec![
+            (format!("{p}URL"), self.base_url()),
+            (format!("{p}PROTOCOL"), self.protocol.to_string()),
+            (format!("{p}API_KEY"), self.api_key()),
+        ];
+        if !self.models.is_empty() {
+            out.push((format!("{p}MODELS"), self.models.join(",")));
+        }
+        out
     }
 }
 
@@ -467,38 +471,65 @@ fn anthropic_tool_frames() -> Vec<String> {
 // Driving the router
 // ---------------------------------------------------------------------------
 
-/// Start the router under test. Returns its address.
-pub async fn start_router(config_toml: &str) -> SocketAddr {
-    let cfg = Config::from_toml(config_toml).expect("test config should be valid");
-    let state = Arc::new(AppState::new(cfg));
-    mini_router::health::spawn_probes(state.clone());
-    let app = mini_router::router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    addr
-}
+/// The environment a router under test is started with.
+///
+/// Configuration is environment variables and nothing else, so tests build one
+/// of these rather than a config document -- which means they exercise exactly
+/// the path a real deployment uses.
+#[derive(Debug, Default)]
+pub struct Env(Vec<(String, String)>);
 
-/// Start the router from environment variables alone -- the docker-compose
-/// path -- without touching the process environment.
-pub async fn start_router_from_env(pairs: &[(&str, &str)]) -> SocketAddr {
-    let vars: Vec<(String, String)> = pairs
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-        .collect();
-    let resolved = mini_router::env::apply(Config::default(), &vars)
-        .unwrap_or_else(|e| panic!("env config should resolve: {e}"));
-    let state = Arc::new(AppState::new(resolved.config));
-    mini_router::health::spawn_probes(state.clone());
-    let app = mini_router::router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    addr
+impl Env {
+    /// A router with active health probing off, so tests are deterministic.
+    /// Anything that wants probing sets the interval back.
+    pub fn new() -> Self {
+        Env(vec![(
+            "MINI_ROUTER_HEALTH_INTERVAL_SECS".into(),
+            "0".into(),
+        )])
+    }
+
+    /// Point the router at a mock provider.
+    pub fn provider(mut self, mock: &Mock) -> Self {
+        self.0.extend(mock.env_vars());
+        self
+    }
+
+    pub fn set(mut self, key: &str, value: &str) -> Self {
+        self.0.push((key.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Define a pool: `pool("fast", &[(&openai, "gpt-4o-mini"), ...])`.
+    pub fn pool(self, name: &str, members: &[(&Mock, &str)]) -> Self {
+        let value = members
+            .iter()
+            .map(|(m, model)| format!("{}:{}", m.name, model))
+            .collect::<Vec<_>>()
+            .join(",");
+        let key = format!("MINI_ROUTER_POOL_{}", name.to_uppercase().replace('-', "_"));
+        self.set(&key, &value)
+    }
+
+    /// Resolve the configuration, failing loudly if the variables are wrong.
+    pub fn resolve(&self) -> Config {
+        mini_router::env::load(&self.0)
+            .unwrap_or_else(|e| panic!("test environment should resolve: {e}"))
+            .config
+    }
+
+    /// Start the router. Returns its address.
+    pub async fn start(self) -> SocketAddr {
+        let state = Arc::new(AppState::new(self.resolve()));
+        mini_router::health::spawn_probes(state.clone());
+        let app = mini_router::router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
 }
 
 pub type TestClient = Client<HttpConnector, Body>;

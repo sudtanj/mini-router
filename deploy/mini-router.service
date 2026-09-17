@@ -26,9 +26,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 #   MINI_ROUTER_REQUIRE_AUTH=true
 #   MINI_ROUTER_API_KEYS=sk-your-own-key
 #
-# `mini-router --help` lists every variable. To use a TOML file as well, add
-# MINI_ROUTER_CONFIG=/etc/mini-router/mini-router.toml here; the environment
-# still overrides it.
+# `mini-router --help` lists every variable. There is no configuration file:
+# this is the whole of it.
 EnvironmentFile=/etc/mini-router/env
 
 Restart=on-failure

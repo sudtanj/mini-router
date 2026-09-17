@@ -1,11 +1,10 @@
 //! mini-router entry point.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use mini_router::config::{Config, ConfigError};
+use mini_router::config::Config;
 use mini_router::env::{self, Source};
 use mini_router::state::{init_crypto, AppState};
 use mini_router::{health, router, version_line};
@@ -17,20 +16,16 @@ mini-router -- one OpenAI- and Anthropic-compatible endpoint over every
 USAGE:
     mini-router [OPTIONS]
 
-    A config file is optional. With none, mini-router configures itself from
-    the environment, which is the intended way to run it under Docker.
+    There is no configuration file. Everything below is an environment
+    variable, so a docker compose `environment:` block is a whole deployment.
 
 OPTIONS:
-    -c, --config <PATH>    Configuration file. Without this, ./mini-router.toml
-                           or $MINI_ROUTER_CONFIG is used if it exists, and
-                           otherwise the environment is the whole config.
         --check            Print the resolved configuration and exit
-    -l, --listen <ADDR>    Override the listen address, e.g. 0.0.0.0:8080
+    -l, --listen <ADDR>    Override MINI_ROUTER_LISTEN, e.g. 0.0.0.0:8080
     -h, --help             Print this help
     -V, --version          Print the version
 
 ENVIRONMENT
-    Settings from the environment always override the config file.
 
   Providers -- the zero-config path is a key on its own:
     OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY,
@@ -96,14 +91,11 @@ EXAMPLE (docker compose)
 ";
 
 struct Args {
-    /// None means "look in the usual places, and fall back to the environment".
-    config: Option<PathBuf>,
     check: bool,
     listen: Option<String>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
-    let mut config: Option<PathBuf> = None;
     let mut check = false;
     let mut listen = None;
 
@@ -120,10 +112,10 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--check" => check = true,
             "-c" | "--config" => {
-                config = Some(
-                    argv.next()
-                        .map(PathBuf::from)
-                        .ok_or_else(|| "--config needs a path".to_string())?,
+                return Err(
+                    "mini-router has no configuration file: every setting is an environment \
+                     variable. Run `mini-router --help` for the list."
+                        .to_string(),
                 );
             }
             "-l" | "--listen" => {
@@ -135,40 +127,12 @@ fn parse_args() -> Result<Option<Args>, String> {
             other => return Err(format!("unknown argument {other:?}\n\n{USAGE}")),
         }
     }
-    Ok(Some(Args {
-        config,
-        check,
-        listen,
-    }))
+    Ok(Some(Args { check, listen }))
 }
 
-/// Load the config file if there is one, then let the environment override it.
-///
-/// A missing file is only an error when it was asked for by name: running with
-/// nothing but environment variables is the normal Docker case, not a mistake.
-fn resolve_config(
-    explicit: Option<&Path>,
-) -> Result<(Config, BTreeMap<String, Source>, String), ConfigError> {
-    let (base, origin) = match explicit {
-        Some(path) => (Config::load(path)?, path.display().to_string()),
-        None => {
-            let candidate = std::env::var("MINI_ROUTER_CONFIG")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("mini-router.toml"));
-            if candidate.is_file() {
-                (Config::load(&candidate)?, candidate.display().to_string())
-            } else {
-                (Config::default(), "environment only".to_string())
-            }
-        }
-    };
-    let resolved = env::apply(base, &env::vars())?;
-    Ok((resolved.config, resolved.sources, origin))
-}
-
-fn print_check(cfg: &Config, sources: &BTreeMap<String, Source>, origin: &str) {
+fn print_check(cfg: &Config, sources: &BTreeMap<String, Source>) {
     println!(
-        "configuration ok ({origin}): {} provider(s), {} pool(s), strategy {}, spillover {}",
+        "configuration ok: {} provider(s), {} pool(s), strategy {}, spillover {}",
         cfg.upstreams.len(),
         cfg.pools.len(),
         cfg.balance.strategy,
@@ -181,7 +145,7 @@ fn print_check(cfg: &Config, sources: &BTreeMap<String, Source>, origin: &str) {
         let source = sources
             .get(&up.name)
             .map(Source::to_string)
-            .unwrap_or_else(|| "file".into());
+            .unwrap_or_else(|| "set".into());
         println!(
             "  provider  {:<14} {:<10} [{:<4}] {}{}",
             up.name,
@@ -232,8 +196,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let (mut cfg, sources, origin) = match resolve_config(args.config.as_deref()) {
-        Ok(v) => v,
+    let (mut cfg, sources) = match env::load(&env::vars()) {
+        Ok(r) => (r.config, r.sources),
         Err(e) => {
             eprintln!("mini-router: configuration error: {e}");
             return ExitCode::FAILURE;
@@ -251,7 +215,7 @@ fn main() -> ExitCode {
     }
 
     if args.check {
-        print_check(&cfg, &sources, &origin);
+        print_check(&cfg, &sources);
         return ExitCode::SUCCESS;
     }
 

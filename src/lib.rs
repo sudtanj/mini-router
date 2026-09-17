@@ -16,35 +16,34 @@
 //!   each provider wants to be authenticated.
 //! - [`translate`] converts between the dialects, including incremental
 //!   translation of server-sent event streams.
-//! - [`config`] defines pools: one client-facing model name over several
-//!   provider models, tried in order.
+//! - [`env`] turns environment variables into a configuration, and [`config`]
+//!   holds the shape -- including pools: one client-facing model name over
+//!   several provider models, tried in order.
 //! - [`balance`] orders the candidates for a request.
 //! - [`proxy`] tries them until one answers, spilling over on any failure.
 //!
+//! Configuration is environment variables and nothing else -- there is no
+//! config file -- so a `docker compose` file with an `environment:` block is a
+//! complete deployment.
+//!
 //! ```no_run
-//! use mini_router::{config::Config, state::AppState, router};
+//! use mini_router::{env, state::AppState, router};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let cfg = Config::from_toml(r#"
-//!     [[upstream]]
-//!     name = "anthropic"
-//!     url = "https://api.anthropic.com/v1"
-//!     protocol = "anthropic"
-//!     api_key_env = "ANTHROPIC_API_KEY"
+//! // In a real process this is `env::vars()`; spelled out here to show the
+//! // shape a compose file supplies.
+//! let vars: Vec<(String, String)> = [
+//!     ("ANTHROPIC_API_KEY", "sk-ant-..."),
+//!     ("OPENAI_API_KEY", "sk-..."),
+//!     ("MINI_ROUTER_POOL_FAST", "openai:gpt-4o-mini,anthropic:claude-haiku-4-5"),
+//! ]
+//! .iter()
+//! .map(|(k, v)| (k.to_string(), v.to_string()))
+//! .collect();
 //!
-//!     [[upstream]]
-//!     name = "openai"
-//!     url = "https://api.openai.com/v1"
-//!     api_key_env = "OPENAI_API_KEY"
-//!
-//!     [pool.fast]
-//!     members = [
-//!       { upstream = "openai", model = "gpt-4o-mini" },
-//!       { upstream = "anthropic", model = "claude-haiku-4-5" },
-//!     ]
-//! "#)?;
-//! let state = Arc::new(AppState::new(cfg));
+//! let config = env::load(&vars)?.config;
+//! let state = Arc::new(AppState::new(config));
 //! let app = router(state.clone());
 //! let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
 //! axum::serve(listener, app).await?;

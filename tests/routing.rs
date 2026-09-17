@@ -10,9 +10,6 @@ use mini_router::protocol::Protocol::{Anthropic, Openai};
 use serde_json::{json, Value};
 use support::*;
 
-/// Config preamble: no background probing, so tests are deterministic.
-const QUIET: &str = "[health]\ninterval_secs = 0\n";
-
 // ---------------------------------------------------------------------------
 // The four-way matrix: either front door reaching either kind of provider
 // ---------------------------------------------------------------------------
@@ -20,7 +17,7 @@ const QUIET: &str = "[health]\ninterval_secs = 0\n";
 #[tokio::test]
 async fn openai_client_to_openai_provider_is_passthrough() {
     let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let res = openai_chat(addr, "gpt-4o-mini").send().await;
     assert_eq!(res.status, 200, "body: {}", res.body);
@@ -40,7 +37,7 @@ async fn openai_client_to_openai_provider_is_passthrough() {
 #[tokio::test]
 async fn openai_client_reaches_an_anthropic_provider() {
     let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let res = Req::post(
         format!("http://{addr}/v1/chat/completions"),
@@ -85,7 +82,7 @@ async fn openai_client_reaches_an_anthropic_provider() {
 #[tokio::test]
 async fn anthropic_client_to_anthropic_provider_is_passthrough() {
     let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let res = anthropic_chat(addr, "claude-haiku-4-5").send().await;
     assert_eq!(res.status, 200, "body: {}", res.body);
@@ -98,7 +95,7 @@ async fn anthropic_client_to_anthropic_provider_is_passthrough() {
 #[tokio::test]
 async fn anthropic_client_reaches_an_openai_provider() {
     let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let res = Req::post(
         format!("http://{addr}/v1/messages"),
@@ -191,7 +188,7 @@ fn streaming_request(
 #[tokio::test]
 async fn an_anthropic_stream_is_translated_into_openai_chunks_incrementally() {
     let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let s = stream(streaming_request(
         format!("http://{addr}/v1/chat/completions"),
@@ -236,7 +233,7 @@ async fn an_anthropic_stream_is_translated_into_openai_chunks_incrementally() {
 #[tokio::test]
 async fn an_openai_stream_is_translated_into_anthropic_events_incrementally() {
     let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let s = stream(streaming_request(
         format!("http://{addr}/v1/messages"),
@@ -288,7 +285,7 @@ async fn an_openai_stream_is_translated_into_anthropic_events_incrementally() {
 #[tokio::test]
 async fn a_same_dialect_stream_passes_straight_through() {
     let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let s = stream(streaming_request(
         format!("http://{addr}/v1/chat/completions"),
@@ -309,7 +306,7 @@ async fn a_same_dialect_stream_passes_straight_through() {
 #[tokio::test]
 async fn tool_calls_translate_from_anthropic_to_openai() {
     let p = start_mock("ant", Anthropic, &["claude-haiku-4-5"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let res = Req::post(
         format!("http://{addr}/v1/chat/completions"),
@@ -345,7 +342,7 @@ async fn tool_calls_translate_from_anthropic_to_openai() {
 #[tokio::test]
 async fn streamed_tool_calls_translate_from_openai_to_anthropic() {
     let p = start_mock("oai", Openai, &["gpt-4o-mini"]).await;
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let s = stream(streaming_request(
         format!("http://{addr}/v1/messages"),
@@ -384,18 +381,12 @@ async fn streamed_tool_calls_translate_from_openai_to_anthropic() {
 async fn pool_setup() -> (Mock, Mock, SocketAddr) {
     let a = start_mock("openai", Openai, &["gpt-4o-mini"]).await;
     let b = start_mock("anthropic", Anthropic, &["claude-haiku-4-5"]).await;
-    let addr = start_router(&format!(
-        r#"{QUIET}{}{}
-        [pool.fast]
-        members = [
-          {{ upstream = "openai", model = "gpt-4o-mini" }},
-          {{ upstream = "anthropic", model = "claude-haiku-4-5" }},
-        ]
-        "#,
-        a.upstream_toml(),
-        b.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&a)
+        .provider(&b)
+        .pool("fast", &[(&a, "gpt-4o-mini"), (&b, "claude-haiku-4-5")])
+        .start()
+        .await;
     (a, b, addr)
 }
 
@@ -462,19 +453,13 @@ async fn an_anthropic_client_can_use_the_same_pool() {
 async fn a_pool_can_override_the_balancing_strategy() {
     let a = start_mock("a", Openai, &["m"]).await;
     let b = start_mock("b", Openai, &["m"]).await;
-    let addr = start_router(&format!(
-        r#"{QUIET}{}{}
-        [pool.spread]
-        strategy = "round-robin"
-        members = [
-          {{ upstream = "a", model = "m" }},
-          {{ upstream = "b", model = "m" }},
-        ]
-        "#,
-        a.upstream_toml(),
-        b.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&a)
+        .provider(&b)
+        .pool("spread", &[(&a, "m"), (&b, "m")])
+        .set("MINI_ROUTER_POOL_SPREAD_STRATEGY", "round-robin")
+        .start()
+        .await;
 
     for _ in 0..10 {
         assert_eq!(openai_chat(addr, "spread").send().await.status, 200);
@@ -495,18 +480,12 @@ async fn every_kind_of_failure_spills_over() {
         let a = start_mock("first", Openai, &["m"]).await;
         let b = start_mock("second", Openai, &["m"]).await;
         a.set_status(status);
-        let addr = start_router(&format!(
-            r#"{QUIET}{}{}
-            [pool.p]
-            members = [
-              {{ upstream = "first", model = "m" }},
-              {{ upstream = "second", model = "m" }},
-            ]
-            "#,
-            a.upstream_toml(),
-            b.upstream_toml()
-        ))
-        .await;
+        let addr = Env::new()
+            .provider(&a)
+            .provider(&b)
+            .pool("p", &[(&a, "m"), (&b, "m")])
+            .start()
+            .await;
 
         let res = openai_chat(addr, "p").send().await;
         assert_eq!(
@@ -524,21 +503,12 @@ async fn every_kind_of_failure_spills_over() {
 async fn a_refused_connection_spills_over() {
     let good = start_mock("good", Openai, &["m"]).await;
     // Port 1 on loopback refuses immediately.
-    let addr = start_router(&format!(
-        r#"{QUIET}
-        [[upstream]]
-        name = "dead"
-        url = "http://127.0.0.1:1/v1"
-        {}
-        [pool.p]
-        members = [
-          {{ upstream = "dead", model = "m" }},
-          {{ upstream = "good", model = "m" }},
-        ]
-        "#,
-        good.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .set("MINI_ROUTER_PROVIDER_DEAD_URL", "http://127.0.0.1:1/v1")
+        .provider(&good)
+        .set("MINI_ROUTER_POOL_P", &format!("dead:m,{}:m", good.name))
+        .start()
+        .await;
 
     let res = openai_chat(addr, "p").send().await;
     assert_eq!(res.status, 200, "body: {}", res.body);
@@ -550,22 +520,14 @@ async fn status_list_spillover_can_be_narrowed() {
     let a = start_mock("first", Openai, &["m"]).await;
     let b = start_mock("second", Openai, &["m"]).await;
     a.set_status(400);
-    let addr = start_router(&format!(
-        r#"{QUIET}
-        [balance]
-        spillover = "status-list"
-        retry_on_status = [503]
-        {}{}
-        [pool.p]
-        members = [
-          {{ upstream = "first", model = "m" }},
-          {{ upstream = "second", model = "m" }},
-        ]
-        "#,
-        a.upstream_toml(),
-        b.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .set("MINI_ROUTER_SPILLOVER", "status-list")
+        .set("MINI_ROUTER_RETRY_ON_STATUS", "503")
+        .provider(&a)
+        .provider(&b)
+        .pool("p", &[(&a, "m"), (&b, "m")])
+        .start()
+        .await;
 
     // 400 is not in the list, so it is the client's answer.
     let res = openai_chat(addr, "p").send().await;
@@ -583,18 +545,12 @@ async fn the_last_providers_own_error_reaches_the_client() {
     let b = start_mock("second", Anthropic, &["m"]).await;
     a.set_status(500);
     b.set_status(429);
-    let addr = start_router(&format!(
-        r#"{QUIET}{}{}
-        [pool.p]
-        members = [
-          {{ upstream = "first", model = "m" }},
-          {{ upstream = "second", model = "m" }},
-        ]
-        "#,
-        a.upstream_toml(),
-        b.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&a)
+        .provider(&b)
+        .pool("p", &[(&a, "m"), (&b, "m")])
+        .start()
+        .await;
 
     let res = openai_chat(addr, "p").send().await;
     // The status and the message come from the provider, not from us.
@@ -617,7 +573,7 @@ async fn the_last_providers_own_error_reaches_the_client() {
 async fn an_anthropic_client_gets_errors_in_its_own_dialect() {
     let p = start_mock("oai", Openai, &["m"]).await;
     p.set_status(500);
-    let addr = start_router(&format!("{QUIET}{}", p.upstream_toml())).await;
+    let addr = Env::new().provider(&p).start().await;
 
     let res = anthropic_chat(addr, "m").send().await;
     assert_eq!(res.status, 500);
@@ -638,18 +594,12 @@ async fn a_rate_limited_provider_is_parked_for_the_time_it_asked_for() {
     let b = start_mock("spare", Openai, &["m"]).await;
     a.set_status(429);
     a.set_retry_after(60);
-    let addr = start_router(&format!(
-        r#"{QUIET}{}{}
-        [pool.p]
-        members = [
-          {{ upstream = "limited", model = "m" }},
-          {{ upstream = "spare", model = "m" }},
-        ]
-        "#,
-        a.upstream_toml(),
-        b.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&a)
+        .provider(&b)
+        .pool("p", &[(&a, "m"), (&b, "m")])
+        .start()
+        .await;
 
     assert_eq!(openai_chat(addr, "p").send().await.status, 200);
     assert_eq!(a.hits(), 1);
@@ -681,22 +631,14 @@ async fn a_rate_limited_provider_is_parked_for_the_time_it_asked_for() {
 async fn each_provider_gets_its_own_credential_in_its_own_header() {
     let a = start_mock("openai", Openai, &["m"]).await;
     let b = start_mock("anthropic", Anthropic, &["m"]).await;
-    let addr = start_router(&format!(
-        r#"{QUIET}
-        [server.auth]
-        require_auth = true
-        api_keys = ["sk-client"]
-        {}{}
-        [pool.p]
-        members = [
-          {{ upstream = "openai", model = "m" }},
-          {{ upstream = "anthropic", model = "m" }},
-        ]
-        "#,
-        a.upstream_toml(),
-        b.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .set("MINI_ROUTER_REQUIRE_AUTH", "true")
+        .set("MINI_ROUTER_API_KEYS", "sk-client")
+        .provider(&a)
+        .provider(&b)
+        .pool("p", &[(&a, "m"), (&b, "m")])
+        .start()
+        .await;
 
     assert_eq!(
         openai_chat(addr, "p")
@@ -737,15 +679,12 @@ async fn each_provider_gets_its_own_credential_in_its_own_header() {
 #[tokio::test]
 async fn client_auth_accepts_either_sdks_header() {
     let p = start_mock("oai", Openai, &["m"]).await;
-    let addr = start_router(&format!(
-        r#"{QUIET}
-        [server.auth]
-        require_auth = true
-        api_keys = ["sk-client"]
-        {}"#,
-        p.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .set("MINI_ROUTER_REQUIRE_AUTH", "true")
+        .set("MINI_ROUTER_API_KEYS", "sk-client")
+        .provider(&p)
+        .start()
+        .await;
 
     // An OpenAI SDK sends a bearer token.
     assert_eq!(
@@ -854,18 +793,16 @@ async fn aliases_resolve_onto_pools_and_models() {
     let (a, _b, addr_unused) = pool_setup().await;
     let _ = addr_unused;
     let b = start_mock("anthropic2", Anthropic, &["claude-haiku-4-5"]).await;
-    let addr = start_router(&format!(
-        r#"{QUIET}{}{}
-        [alias]
-        "gpt-3.5-turbo" = "fast"
-        "dangling" = "nothing-serves-this"
-        [pool.fast]
-        members = [{{ upstream = "openai", model = "gpt-4o-mini" }}]
-        "#,
-        a.upstream_toml(),
-        b.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&a)
+        .provider(&b)
+        .pool("fast", &[(&a, "gpt-4o-mini")])
+        .set(
+            "MINI_ROUTER_ALIASES",
+            "gpt-3.5-turbo=fast,dangling=nothing-serves-this",
+        )
+        .start()
+        .await;
 
     // An app hard-coded to gpt-3.5-turbo lands on the pool.
     let res = openai_chat(addr, "gpt-3.5-turbo").send().await;
@@ -894,12 +831,7 @@ async fn aliases_resolve_onto_pools_and_models() {
 async fn an_untranslatable_endpoint_only_reaches_its_own_dialect() {
     let oai = start_mock("oai", Openai, &["m"]).await;
     let ant = start_mock("ant", Anthropic, &["m"]).await;
-    let addr = start_router(&format!(
-        "{QUIET}{}{}",
-        ant.upstream_toml(),
-        oai.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new().provider(&ant).provider(&oai).start().await;
 
     // Embeddings have no Anthropic equivalent, so the Anthropic provider must
     // be skipped rather than sent something it cannot answer.
@@ -918,17 +850,11 @@ async fn an_untranslatable_endpoint_only_reaches_its_own_dialect() {
 async fn max_concurrency_is_enforced_per_provider() {
     let p = start_mock("slow", Openai, &["m"]).await;
     p.set_delay(Duration::from_millis(120));
-    let addr = start_router(&format!(
-        r#"{QUIET}
-        [[upstream]]
-        name = "slow"
-        url = "{}"
-        max_concurrency = 1
-        models = ["m"]
-        "#,
-        p.base_url()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&p)
+        .set("MINI_ROUTER_PROVIDER_SLOW_MAX_CONCURRENCY", "1")
+        .start()
+        .await;
 
     let tasks: Vec<_> = (0..4)
         .map(|_| tokio::spawn(async move { openai_chat(addr, "m").send().await }))
@@ -947,23 +873,15 @@ async fn max_concurrency_is_enforced_per_provider() {
 #[tokio::test]
 async fn health_probing_discovers_models_and_drops_dead_providers() {
     let p = start_mock("ant", Anthropic, &["discovered-claude"]).await;
-    let addr = start_router(&format!(
-        r#"
-        [health]
-        interval_secs = 1
-        timeout_secs = 1
-        failure_threshold = 1
-        success_threshold = 1
-        cooldown_secs = 30
-        [[upstream]]
-        name = "ant"
-        url = "{}"
-        protocol = "anthropic"
-        api_key = "sk-x"
-        "#,
-        p.base_url()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&p)
+        // This is the one test that wants live probing.
+        .set("MINI_ROUTER_HEALTH_INTERVAL_SECS", "1")
+        .set("MINI_ROUTER_HEALTH_TIMEOUT_SECS", "1")
+        .set("MINI_ROUTER_FAILURE_THRESHOLD", "1")
+        .set("MINI_ROUTER_SUCCESS_THRESHOLD", "1")
+        .start()
+        .await;
 
     let models_url = format!("http://{addr}/v1/models");
     wait_until("model discovery", Duration::from_secs(10), || {
@@ -1035,14 +953,11 @@ async fn admin_and_metrics_report_traffic_and_translation() {
 #[tokio::test]
 async fn unknown_paths_and_oversized_bodies_are_rejected() {
     let p = start_mock("oai", Openai, &["m"]).await;
-    let addr = start_router(&format!(
-        r#"{QUIET}
-        [server]
-        max_body_bytes = 1024
-        {}"#,
-        p.upstream_toml()
-    ))
-    .await;
+    let addr = Env::new()
+        .provider(&p)
+        .set("MINI_ROUTER_MAX_BODY_BYTES", "1024")
+        .start()
+        .await;
 
     // Not an API path: must 404 rather than be forwarded to a paid provider.
     let unknown = get(&format!("http://{addr}/not-a-thing")).await;
@@ -1068,26 +983,26 @@ async fn a_router_configured_only_by_environment_variables_works() {
     let a = start_mock("openai", Openai, &["gpt-4o-mini"]).await;
     let b = start_mock("anthropic", Anthropic, &["claude-haiku-4-5"]).await;
 
-    // Exactly what would sit under `environment:` in a compose file.
-    let addr = start_router_from_env(&[
-        ("MINI_ROUTER_PROVIDER_OPENAI_URL", &a.base_url()),
-        ("MINI_ROUTER_PROVIDER_OPENAI_API_KEY", "sk-openai-secret"),
-        ("MINI_ROUTER_PROVIDER_ANTHROPIC_URL", &b.base_url()),
-        ("MINI_ROUTER_PROVIDER_ANTHROPIC_PROTOCOL", "anthropic"),
-        (
+    // Spelled out the way a compose file would, rather than through the
+    // builder, so the exact variable names stay covered.
+    let addr = Env::new()
+        .set("MINI_ROUTER_PROVIDER_OPENAI_URL", &a.base_url())
+        .set("MINI_ROUTER_PROVIDER_OPENAI_API_KEY", "sk-openai-secret")
+        .set("MINI_ROUTER_PROVIDER_ANTHROPIC_URL", &b.base_url())
+        .set("MINI_ROUTER_PROVIDER_ANTHROPIC_PROTOCOL", "anthropic")
+        .set(
             "MINI_ROUTER_PROVIDER_ANTHROPIC_API_KEY",
             "sk-anthropic-secret",
-        ),
-        (
+        )
+        .set(
             "MINI_ROUTER_POOL_FAST",
             "openai:gpt-4o-mini,anthropic:claude-haiku-4-5",
-        ),
-        ("MINI_ROUTER_ALIASES", "gpt-3.5-turbo=fast"),
-        ("MINI_ROUTER_REQUIRE_AUTH", "true"),
-        ("MINI_ROUTER_API_KEYS", "sk-client"),
-        ("MINI_ROUTER_HEALTH_INTERVAL_SECS", "0"),
-    ])
-    .await;
+        )
+        .set("MINI_ROUTER_ALIASES", "gpt-3.5-turbo=fast")
+        .set("MINI_ROUTER_REQUIRE_AUTH", "true")
+        .set("MINI_ROUTER_API_KEYS", "sk-client")
+        .start()
+        .await;
 
     // The pool works, from the first member.
     let res = openai_chat(addr, "fast").bearer("sk-client").send().await;
@@ -1125,13 +1040,12 @@ async fn a_router_configured_only_by_environment_variables_works() {
 #[tokio::test]
 async fn admin_and_metrics_can_be_switched_off_from_the_environment() {
     let p = start_mock("oai", Openai, &["m"]).await;
-    let addr = start_router_from_env(&[
-        ("MINI_ROUTER_PROVIDER_OAI_URL", &p.base_url()),
-        ("MINI_ROUTER_ADMIN", "false"),
-        ("MINI_ROUTER_METRICS", "false"),
-        ("MINI_ROUTER_HEALTH_INTERVAL_SECS", "0"),
-    ])
-    .await;
+    let addr = Env::new()
+        .provider(&p)
+        .set("MINI_ROUTER_ADMIN", "false")
+        .set("MINI_ROUTER_METRICS", "false")
+        .start()
+        .await;
 
     // Gone, not merely unauthenticated.
     assert_eq!(get(&format!("http://{addr}/metrics")).await.status, 404);

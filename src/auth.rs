@@ -49,7 +49,6 @@ pub fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use axum::http::HeaderValue;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -61,22 +60,18 @@ mod tests {
     }
 
     fn state(require_auth: bool, keys: &[&str]) -> AppState {
-        let toml = format!(
-            r#"
-            [server.auth]
-            require_auth = {require_auth}
-            api_keys = [{}]
-
-            [[upstream]]
-            name = "a"
-            url = "http://127.0.0.1:11434/v1"
-            "#,
-            keys.iter()
-                .map(|k| format!("{k:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        AppState::new(Config::from_toml(&toml).unwrap())
+        let vars = vec![
+            (
+                "MINI_ROUTER_PROVIDER_A_URL".to_string(),
+                "http://127.0.0.1:11434/v1".to_string(),
+            ),
+            (
+                "MINI_ROUTER_REQUIRE_AUTH".to_string(),
+                require_auth.to_string(),
+            ),
+            ("MINI_ROUTER_API_KEYS".to_string(), keys.join(",")),
+        ];
+        AppState::new(crate::env::load(&vars).unwrap().config)
     }
 
     #[test]

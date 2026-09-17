@@ -68,14 +68,16 @@ First release.
   well-known provider's URL.
 - `MINI_ROUTER_POOL_<NAME>=provider:model,provider:model` defines a pool in one
   variable; `_STRATEGY`, `_WEIGHTS` and `_DESCRIPTION` refine it.
-- A TOML file still works and the environment overrides it, so an image can
-  ship a base config that a deployment adjusts.
+- There is no configuration file at all: nothing to write, mount, template or
+  keep in sync with the image. Dropping the TOML parser took 233 KB and six
+  crates out of the build.
 - An unrecognised or malformed variable is a startup error naming the variable
   and what was expected, never a silent default.
 - `--check` prints the resolved setup, including where each provider came from
   and whether its key resolved.
-- `docker-compose.yml`, `.env.example` and a `.dockerignore` ship with the repo;
-  the Dockerfile and systemd unit need no config file.
+- `docker-compose.yml`, `.env.example` and a `.dockerignore` ship with the repo,
+  and are themselves checked by a test that rejects any variable mini-router
+  would not accept -- so the examples cannot drift from the code.
 
 **Operations**
 
@@ -99,7 +101,7 @@ First release.
 ### Performance
 
 Measured on x86_64 against a mock provider streaming SSE through the
-translator: a 2.4 MB stripped binary (1.4 MB without TLS), 4.8 MB resident at
+translator: a 2.2 MB stripped binary (1.3 MB without TLS), 4.8 MB resident at
 idle, and 4.8 MB resident during 48 concurrent translated streams.
 
 [Unreleased]: https://github.com/sudtanj/mini-router/compare/v0.1.0...HEAD

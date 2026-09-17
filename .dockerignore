@@ -3,4 +3,3 @@ target/
 .github/
 *.md
 .env
-mini-router.toml
